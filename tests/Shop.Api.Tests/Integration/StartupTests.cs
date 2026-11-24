@@ -3,13 +3,21 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Shop.Api.Auth;
 using Shop.Api.Storage;
 
 namespace Shop.Api.Tests.Integration;
 
-/// <summary>The app with the operator's environment variables set, as a pod would get them.</summary>
-public sealed class ShopApp(IReadOnlyDictionary<string, string?> env) : WebApplicationFactory<Program>
+/// <summary>
+/// The app with the operator's environment variables set, as a pod would get them. All log output
+/// (Debug and up) goes to <paramref name="logs"/> when given, for the FR-024 leak checks.
+/// </summary>
+public sealed class ShopApp(
+    IReadOnlyDictionary<string, string?> env,
+    LogSink? logs = null,
+    TimeSpan? startupTimeout = null) : WebApplicationFactory<Program>
 {
     public const string AdminPassword = "generated-admin-password";
 
@@ -26,6 +34,59 @@ public sealed class ShopApp(IReadOnlyDictionary<string, string?> env) : WebAppli
         {
             builder.UseSetting(key, value);
         }
+
+        if (logs is not null)
+        {
+            builder.ConfigureLogging(l => l.SetMinimumLevel(LogLevel.Debug).AddProvider(logs));
+        }
+
+        if (startupTimeout is { } timeout)
+        {
+            builder.ConfigureServices(s => s.Configure<HostOptions>(o => o.StartupTimeout = timeout));
+        }
+    }
+}
+
+/// <summary>Collects every log message and exception text written by the app.</summary>
+public sealed class LogSink : ILoggerProvider
+{
+    private readonly List<string> _lines = [];
+
+    public IReadOnlyList<string> Lines
+    {
+        get
+        {
+            lock (_lines)
+            {
+                return [.. _lines];
+            }
+        }
+    }
+
+    public ILogger CreateLogger(string categoryName) => new Logger(this, categoryName);
+
+    public void Dispose()
+    {
+    }
+
+    private void Add(string line)
+    {
+        lock (_lines)
+        {
+            _lines.Add(line);
+        }
+    }
+
+    private sealed class Logger(LogSink sink, string category) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            sink.Add($"{logLevel} {category}: {formatter(state, exception)} {exception}");
     }
 }
 
