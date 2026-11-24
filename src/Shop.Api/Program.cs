@@ -1,14 +1,42 @@
-// Shop application entry point (spec 003). Feature endpoints arrive in later phases.
+// Shop application (spec 003). One image serves the API under /api and the Angular app from /.
+using Shop.Api;
+using Shop.Api.Auth;
+using Shop.Api.Storage;
+using Shop.Api.Storage.Postgres;
+using Shop.Api.Storage.Redis;
+
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton(sp => Settings.Load(sp.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton<IShopStore>(sp =>
+{
+    var settings = sp.GetRequiredService<Settings>();
+    return settings.PostgresConnectionString is { } postgres
+        ? new PostgresShopStore(postgres)
+        : new RedisShopStore(settings.Redis!);
+});
+builder.Services.AddHostedService<StoreInitializer>();
+builder.Services.AddProblemDetails();
+builder.Services.AddAdminAuth();
 
 var app = builder.Build();
 
+app.UseShopErrorHandling();
 app.UseDefaultFiles();
 app.UseStaticFiles();
+app.UseAuthentication();
+app.UseAuthorization();
 
-app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+// For local checks; the operator's readiness probe is TCP (contracts/http-api.md "Operational").
+app.MapGet("/healthz", async (IShopStore store, CancellationToken ct) =>
+{
+    await store.PingAsync(ct);
+    return Results.Ok(new { status = "ok" });
+});
 
-// Client-side routes are served by the Angular app.
+// Unknown API paths are 404s; every other path is a client route of the Angular app.
+app.MapFallback("/api/{**path}", () => Results.Problem(statusCode: StatusCodes.Status404NotFound));
 app.MapFallbackToFile("index.html");
 
 app.Run();

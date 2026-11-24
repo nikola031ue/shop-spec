@@ -3,6 +3,15 @@
     <RootNamespace>Shop.Api</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Identity.Core" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="StackExchange.Redis" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Storage\Postgres\Scripts\*.sql" LogicalName="pg/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Storage\Redis\Scripts\*.lua" LogicalName="redis/%(Filename)%(Extension)" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="Shop.Api.Tests" />
   </ItemGroup>
 </Project>
