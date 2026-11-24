@@ -72,6 +72,8 @@ public sealed record ItemPageJson(List<ItemJson> Items, int Page, int PageSize, 
 
 public sealed record MeJson(bool InitialPassword);
 
+public sealed record PlacedJson(string Reference, string Status, long TotalCents, DateTimeOffset CreatedAt);
+
 /// <summary>
 /// US1 scenarios 1–6 and the admin security requirements through HTTP, once per store
 /// (contracts/http-api.md "Admin"). Each test gets an empty database.
@@ -372,6 +374,217 @@ public abstract class ApiContract
         Assert.False((await client.GetJsonAsync<MeJson>("/api/admin/me")).InitialPassword);
         await CreateAsync(client, "Shirt", 1, "1");
         Assert.Equal(HttpStatusCode.OK, await MeWithCookieAsync(otherReplica, client.SessionCookie));
+    }
+
+    // ---- Public storefront API (US2) ----
+
+    private static async Task<HttpResponseMessage> OrderAsync(HttpClient anonymous, params object[] lines) =>
+        await anonymous.PostAsJsonAsync(new Uri("/api/orders", UriKind.Relative), new { lines }, Ct);
+
+    /// <summary>FR-009, FR-010, US2 scenario 1: shop name and case-insensitive search, no sign-in.</summary>
+    [Fact]
+    public async Task StorefrontShowsShopNameAndSearches()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var admin = await SignedInAsync(app);
+        await CreateAsync(admin, "Blue T-shirt", 12, "15.00");
+        await CreateAsync(admin, "Red cap", 0, "5");
+        using var anonymous = app.CreateClient();
+
+        Assert.Equal("Acme", (await anonymous.GetFromJsonAsync<JsonElement>("/api/shop", Ct)).GetProperty("name").GetString());
+        var shirts = await anonymous.GetFromJsonAsync<ItemPageJson>("/api/items?q=SHIRT", Ct);
+        Assert.Equal(["Blue T-shirt"], shirts!.Items.Select(i => i.Name));
+        var all = await anonymous.GetFromJsonAsync<ItemPageJson>("/api/items", Ct);
+        Assert.Equal([true, false], all!.Items.Select(i => i.Available));
+        using var badPage = await anonymous.GetAsync(new Uri("/api/items?page=0", UriKind.Relative), Ct);
+        Assert.Equal(HttpStatusCode.BadRequest, badPage.StatusCode);
+    }
+
+    /// <summary>
+    /// US2 scenario 4: the order is stored as PendingPayment with lines, total, time and the shop's
+    /// wallet; stock goes down by exactly the ordered quantities; duplicates are merged.
+    /// </summary>
+    [Fact]
+    public async Task CustomerPlacesOrder()
+    {
+        var env = await FreshEnvAsync();
+        await using var app = new ShopApp(env);
+        using var admin = await SignedInAsync(app);
+        var shirt = await CreateAsync(admin, "Blue T-shirt", 12, "15.00");
+        var cap = await CreateAsync(admin, "Red cap", 3, "5.50");
+        using var anonymous = app.CreateClient();
+        var before = DateTimeOffset.UtcNow.AddSeconds(-1);
+
+        using var response = await OrderAsync(anonymous,
+            new { itemId = shirt.Id, quantity = 1, unitPriceCents = 1500 },
+            new { itemId = cap.Id, quantity = 3, unitPriceCents = 550 },
+            new { itemId = shirt.Id, quantity = 1, unitPriceCents = 1500 });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var placed = (await response.Content.ReadFromJsonAsync<PlacedJson>(Ct))!;
+        Assert.Equal("PendingPayment", placed.Status);
+        Assert.Equal(4650, placed.TotalCents);
+        Assert.Matches("^[0-9A-HJKMNP-TV-Z]{10}$", placed.Reference);
+        Assert.InRange(placed.CreatedAt, before, DateTimeOffset.UtcNow.AddSeconds(1));
+
+        var items = (await anonymous.GetFromJsonAsync<ItemPageJson>("/api/items", Ct))!.Items;
+        Assert.Equal(10, items.Single(i => i.Id == shirt.Id).Stock);
+        Assert.Equal(0, items.Single(i => i.Id == cap.Id).Stock);
+        Assert.False(items.Single(i => i.Id == cap.Id).Available);
+
+        var order = (await app.Services.GetRequiredService<IShopStore>().ListOrdersAsync(1, 20, Ct)).Items.Single();
+        Assert.Equal(placed.Reference, order.Reference);
+        Assert.Equal(env["WALLET_ADDRESS"], order.WalletAddress);
+        Assert.Equal(
+            [new OrderLine(shirt.Id, "Blue T-shirt", 1500, 2), new OrderLine(cap.Id, "Red cap", 550, 3)],
+            order.Lines);
+    }
+
+    /// <summary>US2 scenario 5: changed price, too little stock or a deleted item → 409 with the differences, nothing stored.</summary>
+    [Fact]
+    public async Task ChangedCartIsRefusedWithDifferences()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var admin = await SignedInAsync(app);
+        var shirt = await CreateAsync(admin, "Blue T-shirt", 12, "15.00");
+        var cap = await CreateAsync(admin, "Red cap", 2, "5");
+        var gone = await CreateAsync(admin, "Old hat", 5, "9");
+        (await admin.SendAsync(HttpMethod.Put, $"/api/admin/items/{shirt.Id}", new { name = "Blue T-shirt", stock = 12, price = "16" })).Dispose();
+        (await admin.SendAsync(HttpMethod.Delete, $"/api/admin/items/{gone.Id}")).Dispose();
+        using var anonymous = app.CreateClient();
+
+        using var response = await OrderAsync(anonymous,
+            new { itemId = shirt.Id, quantity = 1, unitPriceCents = 1500 },
+            new { itemId = cap.Id, quantity = 3, unitPriceCents = 500 },
+            new { itemId = gone.Id, quantity = 1, unitPriceCents = 900 });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        var problems = (await ProblemAsync(response)).GetProperty("problems").EnumerateArray()
+            .ToDictionary(p => p.GetProperty("itemId").GetGuid());
+        Assert.Equal("price", problems[shirt.Id].GetProperty("kind").GetString());
+        Assert.Equal(1600, problems[shirt.Id].GetProperty("currentPriceCents").GetInt64());
+        Assert.Equal("stock", problems[cap.Id].GetProperty("kind").GetString());
+        Assert.Equal(2, problems[cap.Id].GetProperty("currentStock").GetInt32());
+        Assert.False(problems[cap.Id].TryGetProperty("currentPriceCents", out _));
+        Assert.Equal("removed", problems[gone.Id].GetProperty("kind").GetString());
+
+        var store = app.Services.GetRequiredService<IShopStore>();
+        Assert.Equal(0, (await store.ListOrdersAsync(1, 20, Ct)).Total);
+        Assert.Equal(2, (await store.GetItemAsync(cap.Id, Ct))!.Stock);
+
+        // The corrected cart goes through.
+        using var retry = await OrderAsync(anonymous,
+            new { itemId = shirt.Id, quantity = 1, unitPriceCents = 1600 },
+            new { itemId = cap.Id, quantity = 2, unitPriceCents = 500 });
+        Assert.Equal(HttpStatusCode.Created, retry.StatusCode);
+        Assert.Equal(2600, (await retry.Content.ReadFromJsonAsync<PlacedJson>(Ct))!.TotalCents);
+    }
+
+    /// <summary>US2 scenario 6: two customers order the last piece at once → exactly one succeeds.</summary>
+    [Fact]
+    public async Task LastPieceGoesToExactlyOneCustomer()
+    {
+        var env = await FreshEnvAsync();
+        await using var app = new ShopApp(env);
+        await using var otherReplica = new ShopApp(env);
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Last one", 1, "10");
+        using var a = app.CreateClient();
+        using var b = otherReplica.CreateClient();
+
+        var responses = await Task.WhenAll(
+            OrderAsync(a, new { itemId = item.Id, quantity = 1, unitPriceCents = 1000 }),
+            OrderAsync(b, new { itemId = item.Id, quantity = 1, unitPriceCents = 1000 }));
+
+        try
+        {
+            Assert.Equal([HttpStatusCode.Created, HttpStatusCode.Conflict], responses.Select(r => r.StatusCode).Order());
+            var loser = responses.Single(r => r.StatusCode == HttpStatusCode.Conflict);
+            var problem = (await ProblemAsync(loser)).GetProperty("problems").EnumerateArray().Single();
+            Assert.Equal("stock", problem.GetProperty("kind").GetString());
+            Assert.Equal(0, problem.GetProperty("currentStock").GetInt32());
+        }
+        finally
+        {
+            foreach (var r in responses)
+            {
+                r.Dispose();
+            }
+        }
+    }
+
+    /// <summary>The client can't choose the price; invalid requests are 400s; no sign-in or XSRF needed.</summary>
+    [Fact]
+    public async Task OrderRequestsAreValidated()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 5, "15");
+        using var anonymous = app.CreateClient();
+
+        using var cheaper = await OrderAsync(anonymous, new { itemId = item.Id, quantity = 1, unitPriceCents = 1 });
+        Assert.Equal(HttpStatusCode.Conflict, cheaper.StatusCode);
+
+        foreach (var lines in new object[][]
+                 {
+                     [],
+                     [new { itemId = item.Id, quantity = 0, unitPriceCents = 1500 }],
+                     [new { itemId = item.Id, quantity = 1001, unitPriceCents = 1500 }],
+                     [new { itemId = item.Id, quantity = 600, unitPriceCents = 1500 }, new { itemId = item.Id, quantity = 401, unitPriceCents = 1500 }],
+                     [new { itemId = item.Id, quantity = 1, unitPriceCents = 0 }],
+                     Enumerable.Range(0, 51).Select(_ => (object)new { itemId = Guid.NewGuid(), quantity = 1, unitPriceCents = 1 }).ToArray(),
+                 })
+        {
+            using var response = await OrderAsync(anonymous, lines);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.True((await ProblemAsync(response)).TryGetProperty("errors", out _));
+        }
+
+        using var noBody = await anonymous.PostAsync(new Uri("/api/orders", UriKind.Relative),
+            new StringContent("{}", System.Text.Encoding.UTF8, "application/json"), Ct);
+        Assert.Equal(HttpStatusCode.BadRequest, noBody.StatusCode);
+
+        Assert.Equal(0, (await app.Services.GetRequiredService<IShopStore>().ListOrdersAsync(1, 20, Ct)).Total);
+        Assert.Equal(5, (await app.Services.GetRequiredService<IShopStore>().GetItemAsync(item.Id, Ct))!.Stock);
+    }
+
+    /// <summary>
+    /// POST /api/orders is rate-limited per client IP: over the limit → 429 with Retry-After and
+    /// nothing stored; other clients and other endpoints are unaffected.
+    /// </summary>
+    [Fact]
+    public async Task OrdersAreRateLimitedPerClientIp()
+    {
+        var env = await FreshEnvAsync();
+        env["ORDER_RATE_LIMIT_PER_MINUTE"] = "3";
+        await using var app = new ShopApp(env);
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 100, "1");
+        using var client = app.CreateClient();
+        client.DefaultRequestHeaders.Add(ShopApp.ClientIpHeader, "203.0.113.7");
+        using var other = app.CreateClient();
+        other.DefaultRequestHeaders.Add(ShopApp.ClientIpHeader, "198.51.100.9");
+        var line = new { itemId = item.Id, quantity = 1, unitPriceCents = 100 };
+
+        for (var i = 0; i < 3; i++)
+        {
+            using var ok = await OrderAsync(client, line);
+            Assert.Equal(HttpStatusCode.Created, ok.StatusCode);
+        }
+
+        using var limited = await OrderAsync(client, line);
+        Assert.Equal((HttpStatusCode)429, limited.StatusCode);
+        var retryAfter = int.Parse(limited.Headers.GetValues("Retry-After").Single(), System.Globalization.CultureInfo.InvariantCulture);
+        Assert.InRange(retryAfter, 1, 60);
+        Assert.Equal(429, (await ProblemAsync(limited)).GetProperty("status").GetInt32());
+
+        using var otherClient = await OrderAsync(other, line);
+        Assert.Equal(HttpStatusCode.Created, otherClient.StatusCode);
+        using var browsing = await client.GetAsync(new Uri("/api/items", UriKind.Relative), Ct);
+        Assert.Equal(HttpStatusCode.OK, browsing.StatusCode);
+
+        Assert.Equal(4, (await app.Services.GetRequiredService<IShopStore>().ListOrdersAsync(1, 20, Ct)).Total);
+        Assert.Equal(96, (await app.Services.GetRequiredService<IShopStore>().GetItemAsync(item.Id, Ct))!.Stock);
     }
 
     /// <summary>FR-005: the changed password replaces the generated one and survives a restart.</summary>

@@ -20,6 +20,7 @@ builder.Services.AddSingleton<IShopStore>(sp =>
 builder.Services.AddHostedService<StoreInitializer>();
 builder.Services.AddProblemDetails();
 builder.Services.AddAdminAuth();
+builder.Services.AddOrderRateLimit();
 
 var app = builder.Build();
 
@@ -28,6 +29,7 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 // For local checks; the operator's readiness probe is TCP (contracts/http-api.md "Operational").
 app.MapGet("/healthz", async (IShopStore store, CancellationToken ct) =>
@@ -36,6 +38,7 @@ app.MapGet("/healthz", async (IShopStore store, CancellationToken ct) =>
     return Results.Ok(new { status = "ok" });
 });
 
+app.MapPublicEndpoints();
 app.MapAdminEndpoints();
 
 // Unknown API paths are 404s; every other path is a client route of the Angular app.

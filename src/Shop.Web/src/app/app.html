@@ -1,5 +1,6 @@
-<header>
-  <h1>Shop</h1>
+<header class="site-header">
+  <h1><a routerLink="/">{{ shop.shopName() || 'Shop' }}</a></h1>
+  <a routerLink="/cart" class="cart-link">Cart ({{ cart.count() }})</a>
 </header>
 <main>
   <router-outlet />

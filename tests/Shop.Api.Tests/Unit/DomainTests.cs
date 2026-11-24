@@ -83,14 +83,28 @@ public sealed class DomainTests
     }
 
     [Fact]
-    public void OrderTotalMustStayExact()
+    public void QuantityPerLineIsCapped()
     {
-        var huge = Enumerable.Range(0, 50)
-            .Select(_ => new OrderRequestLine(Guid.CreateVersion7(), int.MaxValue, Money.MaxPriceCents)).ToList();
+        var a = Guid.CreateVersion7();
 
-        Assert.Contains("lines", OrderRules.Normalize(huge).Errors.Keys);
-        Assert.Contains("lines", OrderRules.Normalize([new(Guid.CreateVersion7(), 90_072, Money.MaxPriceCents)]).Errors.Keys);
-        Assert.Empty(OrderRules.Normalize([new(Guid.CreateVersion7(), 90_071, Money.MaxPriceCents)]).Errors);
+        Assert.Empty(OrderRules.Normalize([new(a, OrderRules.MaxQuantityPerLine, 100)]).Errors);
+        Assert.Contains("lines.quantity", OrderRules.Normalize([new(a, OrderRules.MaxQuantityPerLine + 1, 100)]).Errors.Keys);
+        Assert.Contains("lines.quantity", OrderRules.Normalize([new(a, int.MaxValue, 100)]).Errors.Keys);
+
+        // Duplicates are merged first, so splitting a line doesn't get around the cap.
+        Assert.Contains("lines.quantity", OrderRules.Normalize([new(a, 600, 100), new(a, 401, 100)]).Errors.Keys);
+        Assert.Equal(1000, OrderRules.Normalize([new(a, 600, 100), new(a, 400, 100)]).Lines!.Single().Quantity);
+    }
+
+    [Fact]
+    public void LargestAllowedOrderTotalStaysExact()
+    {
+        var largest = Enumerable.Range(0, OrderRules.MaxLines)
+            .Select(_ => new OrderRequestLine(Guid.CreateVersion7(), OrderRules.MaxQuantityPerLine, Money.MaxPriceCents))
+            .ToList();
+
+        Assert.Empty(OrderRules.Normalize(largest).Errors);
+        Assert.True((Int128)OrderRules.MaxLines * OrderRules.MaxQuantityPerLine * Money.MaxPriceCents <= OrderRules.MaxTotalCents);
     }
 
     [Fact]

@@ -54,3 +54,16 @@ tr.unavailable td { color: var(--muted); }
 .pager { display: flex; gap: 1rem; align-items: center; justify-content: center; margin-top: 1rem; }
 
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* Storefront */
+.site-header { display: flex; align-items: center; justify-content: space-between; }
+.site-header h1 a { color: var(--fg); text-decoration: none; }
+.cart-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.items { list-style: none; padding: 0; margin: 1rem 0 0; }
+.item { display: flex; gap: 1rem; align-items: center; padding: 0.6rem 0; border-bottom: 1px solid var(--line); }
+.item .name { flex: 1; }
+.item .price { min-width: 9rem; text-align: right; }
+.item.unavailable .name, .item.unavailable .price { color: var(--muted); }
+.qty { width: 5rem; }
+.checkout { margin-top: 1rem; }
+.reference { font-family: ui-monospace, monospace; font-size: 1.5rem; letter-spacing: 0.1em; }
