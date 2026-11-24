@@ -20,23 +20,31 @@ public sealed record Order(
     long TotalCents,
     IReadOnlyList<OrderLine> Lines);
 
-/// <summary>One requested line as sent by the customer.</summary>
-public sealed record OrderRequestLine(Guid ItemId, int Quantity, long UnitPriceCents);
+/// <summary>
+/// One requested line as sent by the customer. <see cref="ExpectedUnitPriceCents"/> is the price
+/// the customer saw. It is only compared with the current price (FR-013, a mismatch rejects the
+/// order); stored prices and totals always come from the store, never from the request.
+/// </summary>
+public sealed record OrderRequestLine(Guid ItemId, int Quantity, long ExpectedUnitPriceCents);
 
 /// <summary>An order ready for the store: reference, time and wallet fixed, lines normalised.</summary>
 public sealed record NewOrder(
     string Reference,
     DateTimeOffset CreatedAt,
     string WalletAddress,
-    IReadOnlyList<OrderRequestLine> Lines)
-{
-    public long TotalCents => Lines.Sum(l => checked(l.UnitPriceCents * l.Quantity));
-}
+    IReadOnlyList<OrderRequestLine> Lines);
 
 /// <summary>Rules for data-model.md <c>Order.lines</c> and <c>OrderLine.quantity</c>.</summary>
 public static class OrderRules
 {
     public const int MaxLines = 50;
+
+    /// <summary>
+    /// Largest order total (2^53 − 1 cents) that every store computes exactly. An order is placed
+    /// only when all expected prices equal the current ones, so checking the expected total is
+    /// enough.
+    /// </summary>
+    public const long MaxTotalCents = 9_007_199_254_740_991;
 
     /// <summary>
     /// Checks 1–50 lines, quantity ≥ 1 and price ≥ 1, then merges duplicate item ids (summing the
@@ -57,7 +65,7 @@ public static class OrderRules
             errors["lines.quantity"] = ["Quantity must be at least 1."];
         }
 
-        if (lines.Any(l => l.UnitPriceCents is < 1 or > Money.MaxPriceCents))
+        if (lines.Any(l => l.ExpectedUnitPriceCents is < 1 or > Money.MaxPriceCents))
         {
             errors["lines.unitPriceCents"] = ["Unit price is out of range."];
         }
@@ -79,7 +87,7 @@ public static class OrderRules
             }
 
             var existing = merged[i];
-            if (existing.UnitPriceCents != line.UnitPriceCents)
+            if (existing.ExpectedUnitPriceCents != line.ExpectedUnitPriceCents)
             {
                 errors["lines.unitPriceCents"] = ["The same item appears with different prices."];
                 return (null, errors);
@@ -93,6 +101,14 @@ public static class OrderRules
             }
 
             merged[i] = existing with { Quantity = (int)quantity };
+        }
+
+        // Int128: 50 lines × (2^31 − 1) × MaxPriceCents would overflow a long.
+        var total = merged.Aggregate(Int128.Zero, (sum, l) => sum + ((Int128)l.ExpectedUnitPriceCents * l.Quantity));
+        if (total > MaxTotalCents)
+        {
+            errors["lines"] = ["The order total is too large."];
+            return (null, errors);
         }
 
         return (merged, errors);

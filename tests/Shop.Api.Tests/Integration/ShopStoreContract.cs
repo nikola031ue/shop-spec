@@ -345,6 +345,47 @@ public abstract class ShopStoreContract : IAsyncLifetime
         Assert.Equal(0, (await Store.ListOrdersAsync(1, 20, Ct)).Total);
     }
 
+    /// <summary>
+    /// The client's price is only an expectation (FR-013): a lower or higher price never produces
+    /// an order. Stored line prices and the total come from the store.
+    /// </summary>
+    [Fact]
+    public async Task ClientCannotChooseThePrice()
+    {
+        var shirt = await AddItemAsync("Shirt", 5, 1500);
+
+        foreach (var claimed in new long[] { 1, 1499, 1501, 999_999 })
+        {
+            var rejected = await Store.PlaceOrderAsync(Order(new OrderRequestLine(shirt.Id, 2, claimed)), Ct);
+            Assert.Null(rejected.Order);
+            Assert.Equal([new OrderProblem(shirt.Id, ProblemKind.Price, 1500, 5)], rejected.Problems);
+        }
+
+        Assert.Equal(0, (await Store.ListOrdersAsync(1, 20, Ct)).Total);
+        Assert.Equal(5, (await Store.GetItemAsync(shirt.Id, Ct))!.Stock);
+
+        var placed = (await Store.PlaceOrderAsync(Order(new OrderRequestLine(shirt.Id, 2, 1500)), Ct)).Order!;
+        var stored = (await Store.ListOrdersAsync(1, 20, Ct)).Items.Single();
+        Assert.All(new[] { placed, stored }, o =>
+        {
+            Assert.Equal(1500, o.Lines.Single().UnitPriceCents);
+            Assert.Equal(3000, o.TotalCents);
+        });
+    }
+
+    [Fact]
+    public async Task LargeTotalsStayExact()
+    {
+        var item = await AddItemAsync("Gold bar", 100_000, Money.MaxPriceCents);
+
+        var placed = (await Store.PlaceOrderAsync(
+            Order(new OrderRequestLine(item.Id, 90_071, Money.MaxPriceCents)), Ct)).Order!;
+
+        Assert.Equal(9_007_099_999_909_929, placed.TotalCents);
+        Assert.Equal(9_007_099_999_909_929, (await Store.ListOrdersAsync(1, 20, Ct)).Items.Single().TotalCents);
+        Assert.Equal(100_000 - 90_071, (await Store.GetItemAsync(item.Id, Ct))!.Stock);
+    }
+
     [Fact]
     public async Task ReferenceCollisionIsReportedAndChangesNothing()
     {

@@ -181,7 +181,7 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             {
                 problems.Add(new OrderProblem(line.ItemId, ProblemKind.Removed));
             }
-            else if (item.Price != line.UnitPriceCents)
+            else if (item.Price != line.ExpectedUnitPriceCents)
             {
                 problems.Add(new OrderProblem(line.ItemId, ProblemKind.Price, item.Price, item.Stock));
             }
@@ -191,7 +191,8 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             }
             else
             {
-                lines.Add(new OrderLine(line.ItemId, item.Name, line.UnitPriceCents, line.Quantity));
+                // Price from the store row, never from the request.
+                lines.Add(new OrderLine(line.ItemId, item.Name, item.Price, line.Quantity));
             }
         }
 
@@ -207,7 +208,7 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             """, ct, ("ids", ids), ("qs", order.Lines.Select(l => l.Quantity).ToArray()), ("now", createdAt));
 
         var placed = new Order(order.Reference, createdAt, OrderStatus.PendingPayment, order.WalletAddress,
-            order.TotalCents, lines);
+            lines.Sum(l => checked(l.UnitPriceCents * l.Quantity)), lines);
         var inserted = await ExecuteAsync(conn, $"""
             INSERT INTO orders ({OrderColumns}) VALUES (@ref, @at, @status, @wallet, @total, @lines)
             ON CONFLICT (reference) DO NOTHING

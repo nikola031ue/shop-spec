@@ -83,12 +83,14 @@ public sealed class DomainTests
     }
 
     [Fact]
-    public void OrderTotalIsSumOfLines()
+    public void OrderTotalMustStayExact()
     {
-        var order = new NewOrder("R", DateTimeOffset.UnixEpoch, "0x0",
-            [new(Guid.CreateVersion7(), 2, 150), new(Guid.CreateVersion7(), 1, 1000)]);
+        var huge = Enumerable.Range(0, 50)
+            .Select(_ => new OrderRequestLine(Guid.CreateVersion7(), int.MaxValue, Money.MaxPriceCents)).ToList();
 
-        Assert.Equal(1300, order.TotalCents);
+        Assert.Contains("lines", OrderRules.Normalize(huge).Errors.Keys);
+        Assert.Contains("lines", OrderRules.Normalize([new(Guid.CreateVersion7(), 90_072, Money.MaxPriceCents)]).Errors.Keys);
+        Assert.Empty(OrderRules.Normalize([new(Guid.CreateVersion7(), 90_071, Money.MaxPriceCents)]).Errors);
     }
 
     [Fact]

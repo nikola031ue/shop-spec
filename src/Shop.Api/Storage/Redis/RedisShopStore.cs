@@ -138,13 +138,12 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
             order.CreatedAt.ToUnixTimeMilliseconds(),
             order.WalletAddress,
             OrderStatus.PendingPayment,
-            order.TotalCents,
         };
         foreach (var line in order.Lines)
         {
             args.Add(Id(line.ItemId));
             args.Add(line.Quantity);
-            args.Add(line.UnitPriceCents);
+            args.Add(line.ExpectedUnitPriceCents);
         }
 
         var json = (string)(await (await DbAsync()).ScriptEvaluateAsync(PlaceOrderLua,
