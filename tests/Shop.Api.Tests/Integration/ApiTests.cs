@@ -529,6 +529,8 @@ public abstract class ApiContract
                  {
                      [],
                      [new { itemId = item.Id, quantity = 0, unitPriceCents = 1500 }],
+                     [new { itemId = item.Id, quantity = 1001, unitPriceCents = 1500 }],
+                     [new { itemId = item.Id, quantity = 600, unitPriceCents = 1500 }, new { itemId = item.Id, quantity = 401, unitPriceCents = 1500 }],
                      [new { itemId = item.Id, quantity = 1, unitPriceCents = 0 }],
                      Enumerable.Range(0, 51).Select(_ => (object)new { itemId = Guid.NewGuid(), quantity = 1, unitPriceCents = 1 }).ToArray(),
                  })
@@ -544,6 +546,45 @@ public abstract class ApiContract
 
         Assert.Equal(0, (await app.Services.GetRequiredService<IShopStore>().ListOrdersAsync(1, 20, Ct)).Total);
         Assert.Equal(5, (await app.Services.GetRequiredService<IShopStore>().GetItemAsync(item.Id, Ct))!.Stock);
+    }
+
+    /// <summary>
+    /// POST /api/orders is rate-limited per client IP: over the limit → 429 with Retry-After and
+    /// nothing stored; other clients and other endpoints are unaffected.
+    /// </summary>
+    [Fact]
+    public async Task OrdersAreRateLimitedPerClientIp()
+    {
+        var env = await FreshEnvAsync();
+        env["ORDER_RATE_LIMIT_PER_MINUTE"] = "3";
+        await using var app = new ShopApp(env);
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 100, "1");
+        using var client = app.CreateClient();
+        client.DefaultRequestHeaders.Add(ShopApp.ClientIpHeader, "203.0.113.7");
+        using var other = app.CreateClient();
+        other.DefaultRequestHeaders.Add(ShopApp.ClientIpHeader, "198.51.100.9");
+        var line = new { itemId = item.Id, quantity = 1, unitPriceCents = 100 };
+
+        for (var i = 0; i < 3; i++)
+        {
+            using var ok = await OrderAsync(client, line);
+            Assert.Equal(HttpStatusCode.Created, ok.StatusCode);
+        }
+
+        using var limited = await OrderAsync(client, line);
+        Assert.Equal((HttpStatusCode)429, limited.StatusCode);
+        var retryAfter = int.Parse(limited.Headers.GetValues("Retry-After").Single(), System.Globalization.CultureInfo.InvariantCulture);
+        Assert.InRange(retryAfter, 1, 60);
+        Assert.Equal(429, (await ProblemAsync(limited)).GetProperty("status").GetInt32());
+
+        using var otherClient = await OrderAsync(other, line);
+        Assert.Equal(HttpStatusCode.Created, otherClient.StatusCode);
+        using var browsing = await client.GetAsync(new Uri("/api/items", UriKind.Relative), Ct);
+        Assert.Equal(HttpStatusCode.OK, browsing.StatusCode);
+
+        Assert.Equal(4, (await app.Services.GetRequiredService<IShopStore>().ListOrdersAsync(1, 20, Ct)).Total);
+        Assert.Equal(96, (await app.Services.GetRequiredService<IShopStore>().GetItemAsync(item.Id, Ct))!.Stock);
     }
 
     /// <summary>FR-005: the changed password replaces the generated one and survives a restart.</summary>

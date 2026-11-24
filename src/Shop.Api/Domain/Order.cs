@@ -40,15 +40,21 @@ public static class OrderRules
     public const int MaxLines = 50;
 
     /// <summary>
-    /// Largest order total (2^53 − 1 cents) that every store computes exactly. An order is placed
-    /// only when all expected prices equal the current ones, so checking the expected total is
-    /// enough.
+    /// Most pieces of one item in one order (after merging duplicates). Limits how much stock a
+    /// single request can reserve while unpaid orders still hold stock (released in spec 005).
+    /// </summary>
+    public const int MaxQuantityPerLine = 1000;
+
+    /// <summary>
+    /// Largest order total (2^53 − 1 cents) that every store computes exactly. With the line and
+    /// quantity caps the largest possible total is 50 × 1,000 × <see cref="Money.MaxPriceCents"/>
+    /// ≈ 5 × 10^15, below this; the check stays as a guard if the caps change.
     /// </summary>
     public const long MaxTotalCents = 9_007_199_254_740_991;
 
     /// <summary>
-    /// Checks 1–50 lines, quantity ≥ 1 and price ≥ 1, then merges duplicate item ids (summing the
-    /// quantities, keeping first-seen order). Different prices for the same item are rejected.
+    /// Checks 1–50 lines, quantity 1–1,000 and price ≥ 1, then merges duplicate item ids (summing
+    /// the quantities, keeping first-seen order). Different prices for the same item are rejected.
     /// </summary>
     public static (IReadOnlyList<OrderRequestLine>? Lines, Dictionary<string, string[]> Errors) Normalize(
         IReadOnlyList<OrderRequestLine>? lines)
@@ -60,9 +66,9 @@ public static class OrderRules
             return (null, errors);
         }
 
-        if (lines.Any(l => l.Quantity < 1))
+        if (lines.Any(l => l.Quantity is < 1 or > MaxQuantityPerLine))
         {
-            errors["lines.quantity"] = ["Quantity must be at least 1."];
+            errors["lines.quantity"] = [QuantityMessage];
         }
 
         if (lines.Any(l => l.ExpectedUnitPriceCents is < 1 or > Money.MaxPriceCents))
@@ -93,17 +99,16 @@ public static class OrderRules
                 return (null, errors);
             }
 
-            var quantity = (long)existing.Quantity + line.Quantity;
-            if (quantity > int.MaxValue)
+            var quantity = existing.Quantity + line.Quantity; // each ≤ 1,000, can't overflow
+            if (quantity > MaxQuantityPerLine)
             {
-                errors["lines.quantity"] = ["Quantity is too large."];
+                errors["lines.quantity"] = [QuantityMessage];
                 return (null, errors);
             }
 
-            merged[i] = existing with { Quantity = (int)quantity };
+            merged[i] = existing with { Quantity = quantity };
         }
 
-        // Int128: 50 lines × (2^31 − 1) × MaxPriceCents would overflow a long.
         var total = merged.Aggregate(Int128.Zero, (sum, l) => sum + ((Int128)l.ExpectedUnitPriceCents * l.Quantity));
         if (total > MaxTotalCents)
         {
@@ -113,6 +118,8 @@ public static class OrderRules
 
         return (merged, errors);
     }
+
+    private static readonly string QuantityMessage = $"Quantity must be between 1 and {MaxQuantityPerLine} per item.";
 }
 
 /// <summary>data-model.md <c>Order.reference</c>: 10 Crockford base32 characters from a CSPRNG.</summary>

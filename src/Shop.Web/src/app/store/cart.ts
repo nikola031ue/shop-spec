@@ -3,6 +3,9 @@ import { Injectable, computed, signal } from '@angular/core';
 /** data-model.md "Cart": lives only in the browser, under localStorage["shop.cart"]. */
 export const CART_KEY = 'shop.cart';
 
+/** Server limit per order line (OrderRules.MaxQuantityPerLine). */
+export const MAX_QUANTITY_PER_LINE = 1000;
+
 export interface CartLine {
   itemId: string;
   name: string;
@@ -46,7 +49,7 @@ export class Cart {
       name: item.name,
       unitPriceCents: item.priceCents,
       stock: item.stock,
-      quantity: Math.min(wanted, item.stock),
+      quantity: Math.min(wanted, maxFor(item.stock)),
     };
     this.save(existing ? this.state().map((l) => (l.itemId === item.id ? line : l)) : [...this.state(), line]);
     return limited(line, wanted);
@@ -59,7 +62,7 @@ export class Cart {
       return { quantity: 0 };
     }
     const wanted = Math.max(1, Math.floor(Number.isFinite(quantity) ? quantity : 1));
-    const updated = { ...line, quantity: Math.min(wanted, line.stock) };
+    const updated = { ...line, quantity: Math.min(wanted, maxFor(line.stock)) };
     this.save(this.state().map((l) => (l.itemId === itemId ? updated : l)));
     return limited(updated, wanted);
   }
@@ -87,10 +90,18 @@ export class Cart {
   }
 }
 
+function maxFor(stock: number): number {
+  return Math.min(stock, MAX_QUANTITY_PER_LINE);
+}
+
 function limited(line: CartLine, wanted: number): CartChange {
-  return wanted > line.quantity
-    ? { quantity: line.quantity, message: `Only ${line.stock} of ${line.name} in stock.` }
-    : { quantity: line.quantity };
+  if (wanted <= line.quantity) {
+    return { quantity: line.quantity };
+  }
+  const message = line.stock > MAX_QUANTITY_PER_LINE
+    ? `At most ${MAX_QUANTITY_PER_LINE} of ${line.name} per order.`
+    : `Only ${line.stock} of ${line.name} in stock.`;
+  return { quantity: line.quantity, message };
 }
 
 /** Reads the stored cart, dropping anything malformed. */
@@ -110,6 +121,6 @@ function isLine(value: unknown): value is CartLine {
     typeof l.itemId === 'string' && typeof l.name === 'string' &&
     Number.isInteger(l.unitPriceCents) && l.unitPriceCents > 0 &&
     Number.isInteger(l.quantity) && l.quantity > 0 &&
-    Number.isInteger(l.stock) && l.quantity <= l.stock
+    Number.isInteger(l.stock) && l.quantity <= Math.min(l.stock, MAX_QUANTITY_PER_LINE)
   );
 }

@@ -15,7 +15,7 @@ public static class PublicEndpoints
         var api = app.MapGroup("/api");
         api.MapGet("/shop", (Settings settings) => Results.Ok(new ShopDto(settings.ShopName)));
         api.MapGet("/items", AdminEndpoints.ListItemsAsync);
-        api.MapPost("/orders", PlaceOrderAsync);
+        api.MapPost("/orders", PlaceOrderAsync).RequireRateLimiting(OrderRateLimit.Policy);
         return app;
     }
 

@@ -1,4 +1,5 @@
 using System.Net;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -44,6 +45,28 @@ public sealed class ShopApp(
         {
             builder.ConfigureServices(s => s.Configure<HostOptions>(o => o.StartupTimeout = timeout));
         }
+
+        // TestServer has no peer address; this test-only header simulates distinct client IPs.
+        builder.ConfigureServices(s => s.AddSingleton<IStartupFilter, TestClientIpFilter>());
+    }
+
+    public const string ClientIpHeader = "X-Test-Client-IP";
+
+    private sealed class TestClientIpFilter : IStartupFilter
+    {
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app =>
+        {
+            app.Use((context, nextMiddleware) =>
+            {
+                if (IPAddress.TryParse(context.Request.Headers[ClientIpHeader], out var ip))
+                {
+                    context.Connection.RemoteIpAddress = ip;
+                }
+
+                return nextMiddleware(context);
+            });
+            next(app);
+        };
     }
 }
 

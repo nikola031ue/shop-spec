@@ -1,4 +1,4 @@
-import { CART_KEY, Cart, CartItem } from './cart';
+import { CART_KEY, Cart, CartItem, MAX_QUANTITY_PER_LINE } from './cart';
 
 const shirt: CartItem = { id: 'a', name: 'Blue T-shirt', priceCents: 1500, stock: 3 };
 const cap: CartItem = { id: 'b', name: 'Red cap', priceCents: 550, stock: 10 };
@@ -35,6 +35,15 @@ describe('Cart', () => {
     expect(cart.setQuantity('a', 10).quantity).toBe(3);
     expect(cart.setQuantity('a', 0).quantity).toBe(1);
     expect(cart.setQuantity('a', 2.7)).toEqual({ quantity: 2 });
+  });
+
+  it('limits a line to the server maximum per order', () => {
+    const cart = new Cart();
+    const plenty: CartItem = { id: 'p', name: 'Pens', priceCents: 10, stock: 5000 };
+
+    expect(cart.add(plenty, 1200)).toEqual({ quantity: MAX_QUANTITY_PER_LINE, message: 'At most 1000 of Pens per order.' });
+    expect(cart.setQuantity('p', 4000).quantity).toBe(MAX_QUANTITY_PER_LINE);
+    expect(new Cart().lines()[0].quantity).toBe(MAX_QUANTITY_PER_LINE);
   });
 
   it('refuses unavailable items (FR-012)', () => {
