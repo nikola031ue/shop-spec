@@ -314,6 +314,66 @@ public abstract class ApiContract
         Assert.Equal(HttpStatusCode.Unauthorized, afterLogout.StatusCode);
     }
 
+    /// <summary>Sends a copied session cookie (no cookie jar), as an attacker holding it would.</summary>
+    private static async Task<HttpStatusCode> MeWithCookieAsync(ShopApp app, string? cookie)
+    {
+        using var raw = app.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false });
+        using var request = new HttpRequestMessage(HttpMethod.Get, new Uri("/api/admin/me", UriKind.Relative));
+        request.Headers.Add("Cookie", cookie);
+        using var response = await raw.SendAsync(request, Ct);
+        return response.StatusCode;
+    }
+
+    /// <summary>FR-007: sign-out raises the session version, so a stolen copy of the cookie stops working.</summary>
+    [Fact]
+    public async Task StolenCookieIsRefusedAfterSignOut()
+    {
+        var env = await FreshEnvAsync();
+        await using var app = new ShopApp(env);
+        await using var otherReplica = new ShopApp(env);
+        using var client = await SignedInAsync(app);
+        var stolen = client.SessionCookie;
+        Assert.Equal(HttpStatusCode.OK, await MeWithCookieAsync(app, stolen));
+
+        using var logout = await client.SendAsync(HttpMethod.Post, "/api/admin/logout");
+        Assert.Equal(HttpStatusCode.NoContent, logout.StatusCode);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, await MeWithCookieAsync(app, stolen));
+        Assert.Equal(HttpStatusCode.Unauthorized, await MeWithCookieAsync(otherReplica, stolen));
+
+        // Signing in again gives a working session with the new version.
+        using var again = await SignedInAsync(app);
+        Assert.Equal(HttpStatusCode.OK, await MeWithCookieAsync(otherReplica, again.SessionCookie));
+        Assert.Equal(HttpStatusCode.Unauthorized, await MeWithCookieAsync(app, stolen));
+    }
+
+    /// <summary>
+    /// A password change raises the session version: a stolen cookie stops working, while the
+    /// browser that changed the password gets a fresh cookie and stays signed in.
+    /// </summary>
+    [Fact]
+    public async Task StolenCookieIsRefusedAfterPasswordChange()
+    {
+        var env = await FreshEnvAsync();
+        await using var app = new ShopApp(env);
+        await using var otherReplica = new ShopApp(env);
+        using var client = await SignedInAsync(app);
+        var stolen = client.SessionCookie;
+
+        using var changed = await client.SendAsync(HttpMethod.Post, "/api/admin/password",
+            new { currentPassword = ShopApp.AdminPassword, newPassword = NewPassword });
+        Assert.Equal(HttpStatusCode.NoContent, changed.StatusCode);
+
+        Assert.NotEqual(stolen, client.SessionCookie);
+        Assert.Equal(HttpStatusCode.Unauthorized, await MeWithCookieAsync(app, stolen));
+        Assert.Equal(HttpStatusCode.Unauthorized, await MeWithCookieAsync(otherReplica, stolen));
+
+        // The changing browser keeps working, including XSRF-protected changes.
+        Assert.False((await client.GetJsonAsync<MeJson>("/api/admin/me")).InitialPassword);
+        await CreateAsync(client, "Shirt", 1, "1");
+        Assert.Equal(HttpStatusCode.OK, await MeWithCookieAsync(otherReplica, client.SessionCookie));
+    }
+
     /// <summary>FR-005: the changed password replaces the generated one and survives a restart.</summary>
     [Fact]
     public async Task ChangedPasswordSurvivesRestart()

@@ -34,8 +34,9 @@ public sealed partial class StoreInitializer(
                 LogReady(logger, store.GetType().Name);
                 return;
             }
-            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // Logged even when the start is being cancelled, so the reason is never lost.
                 var error = ex.GetType().Name + ": " + Redaction.Redact(ex.Message);
                 if (error != lastError)
                 {
@@ -43,6 +44,7 @@ public sealed partial class StoreInitializer(
                     lastError = error;
                 }
 
+                cancellationToken.ThrowIfCancellationRequested();
                 await Task.Delay(delay, time, cancellationToken);
                 delay = NextDelay(delay);
             }

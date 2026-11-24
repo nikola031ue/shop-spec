@@ -31,6 +31,7 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
     private static readonly string PlaceOrderLua = Script("place_order");
     private static readonly string FailedSignInLua = Script("failed_signin");
     private static readonly string ReleaseLockLua = Script("release_lock");
+    private static readonly string BumpSessionLua = Script("bump_session");
 
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private ConnectionMultiplexer? _connection;
@@ -74,6 +75,7 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
                     new("failedCount", next.FailedCount),
                     new("failedWindowStart", Ms(next.FailedWindowStart)),
                     new("lockedUntil", Ms(next.LockedUntil)),
+                    new("sessionVersion", next.SessionVersion),
                 ]);
             }
         }
@@ -195,7 +197,8 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
             Time(fields.GetValueOrDefault("changedAt")),
             int.TryParse(fields.GetValueOrDefault("failedCount"), CultureInfo.InvariantCulture, out var n) ? n : 0,
             Time(fields.GetValueOrDefault("failedWindowStart")),
-            Time(fields.GetValueOrDefault("lockedUntil")));
+            Time(fields.GetValueOrDefault("lockedUntil")),
+            long.TryParse(fields.GetValueOrDefault("sessionVersion"), CultureInfo.InvariantCulture, out var v) ? v : 1);
     }
 
     public async Task<AdminRecord> RecordFailedSignInAsync(LockoutPolicy policy, DateTimeOffset now, CancellationToken ct)
@@ -214,17 +217,11 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
         await (await DbAsync()).HashSetAsync(Admin,
             [new("failedCount", 0), new("failedWindowStart", ""), new("lockedUntil", "")]);
 
-    public async Task SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct)
-    {
-        var db = await DbAsync();
-        if (!await db.KeyExistsAsync(Admin))
-        {
-            throw new InvalidOperationException("The admin record is missing.");
-        }
+    public async Task<long> SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct) =>
+        (long)await (await DbAsync()).ScriptEvaluateAsync(BumpSessionLua, [Admin], [passwordHash, Ms(changedAt)]);
 
-        await db.HashSetAsync(Admin,
-            [new("passwordHash", passwordHash), new("initial", "0"), new("changedAt", Ms(changedAt))]);
-    }
+    public async Task<long> BumpSessionVersionAsync(CancellationToken ct) =>
+        (long)await (await DbAsync()).ScriptEvaluateAsync(BumpSessionLua, [Admin]);
 
     public async Task<IReadOnlyList<DataProtectionKey>> GetDataProtectionKeysAsync(CancellationToken ct) =>
         (await (await DbAsync()).HashGetAllAsync(DpKeys))

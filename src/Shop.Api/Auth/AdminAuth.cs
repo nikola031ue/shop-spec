@@ -1,4 +1,7 @@
+using System.Globalization;
+using System.Security.Claims;
 using Microsoft.AspNetCore.Antiforgery;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.DataProtection.KeyManagement;
@@ -21,7 +24,8 @@ public enum SignInStatus
     Locked,
 }
 
-public sealed record SignInResult(SignInStatus Status, TimeSpan RetryAfter = default);
+/// <summary>On success, <see cref="SessionVersion"/> is the version the new session cookie must carry.</summary>
+public sealed record SignInResult(SignInStatus Status, TimeSpan RetryAfter = default, long SessionVersion = 0);
 
 public enum ChangePasswordStatus
 {
@@ -59,7 +63,12 @@ public sealed class AdminAuth(IShopStore store, IPasswordHasher<AdminUser> hashe
             return null;
         }
 
-        return existing with { PasswordHash = hasher.HashPassword(AdminUser.Instance, adminPassword) };
+        // The password changed, so sessions issued with the old one end too.
+        return existing with
+        {
+            PasswordHash = hasher.HashPassword(AdminUser.Instance, adminPassword),
+            SessionVersion = existing.SessionVersion + 1,
+        };
     }
 
     /// <summary>
@@ -82,7 +91,7 @@ public sealed class AdminAuth(IShopStore store, IPasswordHasher<AdminUser> hashe
                 await store.ResetFailedSignInsAsync(ct);
             }
 
-            return new SignInResult(SignInStatus.Success);
+            return new SignInResult(SignInStatus.Success, SessionVersion: admin.SessionVersion);
         }
 
         await store.RecordFailedSignInAsync(Lockout, now, ct);
@@ -92,7 +101,16 @@ public sealed class AdminAuth(IShopStore store, IPasswordHasher<AdminUser> hashe
     public async Task<bool> IsInitialPasswordAsync(CancellationToken ct) =>
         (await store.GetAdminAsync(ct))?.Initial ?? true;
 
-    /// <summary>Changes the password (≥ 12 characters); sets <c>changedAt</c> and <c>initial=false</c>.</summary>
+    /// <summary>Ends every existing admin session (sign-out): their cookies carry an older version now.</summary>
+    public Task<long> EndAllSessionsAsync(CancellationToken ct) => store.BumpSessionVersionAsync(ct);
+
+    public async Task<long> CurrentSessionVersionAsync(CancellationToken ct) =>
+        (await store.GetAdminAsync(ct))?.SessionVersion ?? throw new InvalidOperationException("The admin record is missing.");
+
+    /// <summary>
+    /// Changes the password (≥ 12 characters); sets <c>changedAt</c> and <c>initial=false</c> and
+    /// increments the session version, so every existing session ends.
+    /// </summary>
     public async Task<ChangePasswordStatus> ChangePasswordAsync(string? current, string? replacement, CancellationToken ct)
     {
         if (replacement is null || replacement.Length < MinPasswordLength)
@@ -121,6 +139,47 @@ public static class AdminAuthSetup
     public const string XsrfCookie = "XSRF-TOKEN";
     public const string XsrfHeader = "X-XSRF-TOKEN";
 
+    /// <summary>Claim holding the admin session version the cookie was issued with.</summary>
+    public const string SessionVersionClaim = "shop:session-version";
+
+    /// <summary>Signs the admin in with a cookie bound to <paramref name="sessionVersion"/>, then issues the XSRF cookie.</summary>
+    public static async Task SignInAsync(HttpContext context, long sessionVersion)
+    {
+        var principal = new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim(ClaimTypes.Name, "admin"),
+                new Claim(SessionVersionClaim, sessionVersion.ToString(CultureInfo.InvariantCulture)),
+            ],
+            CookieAuthenticationDefaults.AuthenticationScheme));
+        await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal);
+
+        // The XSRF token is bound to the signed-in user, so issue it for the new principal.
+        context.User = principal;
+        IssueXsrfCookie(context, context.RequestServices.GetRequiredService<IAntiforgery>());
+    }
+
+    /// <summary>
+    /// Refuses a session cookie whose version is older than the admin record's (after sign-out or a
+    /// password change). Checked on admin API requests only, so storefront and static requests
+    /// don't read the store.
+    /// </summary>
+    private static async Task ValidateSessionVersionAsync(CookieValidatePrincipalContext context)
+    {
+        if (!context.Request.Path.StartsWithSegments("/api/admin"))
+        {
+            return;
+        }
+
+        var store = context.HttpContext.RequestServices.GetRequiredService<IShopStore>();
+        var admin = await store.GetAdminAsync(context.HttpContext.RequestAborted);
+        var claim = context.Principal?.FindFirst(SessionVersionClaim)?.Value;
+        if (admin is null || claim != admin.SessionVersion.ToString(CultureInfo.InvariantCulture))
+        {
+            context.RejectPrincipal();
+            await context.HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+        }
+    }
+
     public static IServiceCollection AddAdminAuth(this IServiceCollection services)
     {
         services.AddSingleton<IPasswordHasher<AdminUser>, PasswordHasher<AdminUser>>();
@@ -140,6 +199,7 @@ public static class AdminAuthSetup
                 o.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
                 o.ExpireTimeSpan = TimeSpan.FromHours(8);
                 o.SlidingExpiration = false;
+                o.Events.OnValidatePrincipal = ValidateSessionVersionAsync;
                 o.Events.OnRedirectToLogin = ctx =>
                 {
                     ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;

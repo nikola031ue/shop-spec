@@ -21,7 +21,7 @@ public static class AdminEndpoints
 
         // Authorization runs before the XSRF filter: no session → 401, session without token → 400.
         var admin = api.MapGroup("").RequireAuthorization(AdminAuth.Policy);
-        admin.MapPost("/logout", (Delegate)LogoutAsync).RequireXsrf();
+        admin.MapPost("/logout", LogoutAsync).RequireXsrf();
         admin.MapGet("/me", MeAsync);
         admin.MapPost("/password", ChangePasswordAsync).RequireXsrf();
         admin.MapGet("/items", ListItemsAsync);
@@ -47,7 +47,7 @@ public static class AdminEndpoints
     public sealed record MeDto(bool InitialPassword);
 
     private static async Task<IResult> LoginAsync(
-        LoginRequest request, AdminAuth auth, IAntiforgery antiforgery, HttpContext context, CancellationToken ct)
+        LoginRequest request, AdminAuth auth, HttpContext context, CancellationToken ct)
     {
         var result = await auth.SignInAsync(request.Password, ct);
         switch (result.Status)
@@ -61,18 +61,14 @@ public static class AdminEndpoints
                 return Results.Problem(statusCode: StatusCodes.Status401Unauthorized, title: "Wrong password.");
         }
 
-        var principal = new ClaimsPrincipal(new ClaimsIdentity(
-            [new Claim(ClaimTypes.Name, "admin")], CookieAuthenticationDefaults.AuthenticationScheme));
-        await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal);
-
-        // The XSRF token is bound to the signed-in user, so issue it for the new principal.
-        context.User = principal;
-        AdminAuthSetup.IssueXsrfCookie(context, antiforgery);
+        await AdminAuthSetup.SignInAsync(context, result.SessionVersion);
         return Results.NoContent();
     }
 
-    private static async Task<IResult> LogoutAsync(HttpContext context)
+    /// <summary>Ends this and every other admin session: copies of the cookie stop working too.</summary>
+    private static async Task<IResult> LogoutAsync(AdminAuth auth, HttpContext context, CancellationToken ct)
     {
+        await auth.EndAllSessionsAsync(ct);
         await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
         context.Response.Cookies.Delete(AdminAuthSetup.XsrfCookie);
         return Results.NoContent();
@@ -86,17 +82,27 @@ public static class AdminEndpoints
         return Results.Ok(new MeDto(await auth.IsInitialPasswordAsync(ct)));
     }
 
-    private static async Task<IResult> ChangePasswordAsync(PasswordRequest request, AdminAuth auth, CancellationToken ct) =>
-        await auth.ChangePasswordAsync(request.CurrentPassword, request.NewPassword, ct) switch
+    /// <summary>
+    /// A successful change ends every existing session (new session version) and signs this browser
+    /// in again with the new version.
+    /// </summary>
+    private static async Task<IResult> ChangePasswordAsync(
+        PasswordRequest request, AdminAuth auth, HttpContext context, CancellationToken ct)
+    {
+        switch (await auth.ChangePasswordAsync(request.CurrentPassword, request.NewPassword, ct))
         {
-            ChangePasswordStatus.TooShort => Results.ValidationProblem(new Dictionary<string, string[]>
-            {
-                ["newPassword"] = [$"The new password must have at least {AdminAuth.MinPasswordLength} characters."],
-            }),
-            ChangePasswordStatus.WrongCurrentPassword =>
-                Results.Problem(statusCode: StatusCodes.Status401Unauthorized, title: "The current password is wrong."),
-            _ => Results.NoContent(),
-        };
+            case ChangePasswordStatus.TooShort:
+                return Results.ValidationProblem(new Dictionary<string, string[]>
+                {
+                    ["newPassword"] = [$"The new password must have at least {AdminAuth.MinPasswordLength} characters."],
+                });
+            case ChangePasswordStatus.WrongCurrentPassword:
+                return Results.Problem(statusCode: StatusCodes.Status401Unauthorized, title: "The current password is wrong.");
+        }
+
+        await AdminAuthSetup.SignInAsync(context, await auth.CurrentSessionVersionAsync(ct));
+        return Results.NoContent();
+    }
 
     private static async Task<IResult> ListItemsAsync(IShopStore store, CancellationToken ct, string? q = null, int page = 1)
     {

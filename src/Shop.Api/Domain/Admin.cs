@@ -1,13 +1,18 @@
 namespace Shop.Api.Domain;
 
-/// <summary>The single admin record (data-model.md "Admin"). The hash never leaves the server.</summary>
+/// <summary>
+/// The single admin record (data-model.md "Admin"). The hash never leaves the server.
+/// <see cref="SessionVersion"/> goes up on sign-out and password change; session cookies carry
+/// the version they were issued with and are refused once it is older.
+/// </summary>
 public sealed record AdminRecord(
     string PasswordHash,
     bool Initial,
     DateTimeOffset? ChangedAt,
     int FailedCount,
     DateTimeOffset? FailedWindowStart,
-    DateTimeOffset? LockedUntil);
+    DateTimeOffset? LockedUntil,
+    long SessionVersion = 1);
 
 /// <summary>
 /// FR-006 lockout: <see cref="MaxFailures"/> failures within <see cref="Window"/> (counted from the

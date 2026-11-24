@@ -120,12 +120,41 @@ public abstract class ShopStoreContract : IAsyncLifetime
     [Fact]
     public async Task PasswordChangeSetsChangedAtAndClearsInitial()
     {
-        await Store.SetAdminPasswordAsync("hash-changed", T0, Ct);
+        var version = await Store.SetAdminPasswordAsync("hash-changed", T0, Ct);
 
         var admin = await Store.GetAdminAsync(Ct);
         Assert.Equal("hash-changed", admin!.PasswordHash);
         Assert.False(admin.Initial);
         Assert.Equal(T0, admin.ChangedAt);
+        Assert.Equal(2, version);
+        Assert.Equal(2, admin.SessionVersion);
+    }
+
+    [Fact]
+    public async Task SessionVersionStartsAtOneAndOnlyGoesUp()
+    {
+        Assert.Equal(1, (await Store.GetAdminAsync(Ct))!.SessionVersion);
+
+        Assert.Equal(2, await Store.BumpSessionVersionAsync(Ct));
+        Assert.Equal(3, await Store.SetAdminPasswordAsync("hash-changed", T0, Ct));
+
+        // Lockout and bootstrap writes keep it.
+        await Store.RecordFailedSignInAsync(LockoutPolicy.Default, T0, Ct);
+        await Store.ResetFailedSignInsAsync(Ct);
+        await Store.InitializeAsync(_ => null, Ct);
+        Assert.Equal(3, (await NewStore().GetAdminAsync(Ct))!.SessionVersion);
+    }
+
+    [Fact]
+    public async Task ConcurrentSessionBumpsAreAllCounted()
+    {
+        var replicas = Enumerable.Range(0, 3).Select(_ => NewStore()).ToList();
+
+        var versions = await Task.WhenAll(Enumerable.Range(0, 30).Select(i =>
+            Task.Run(() => replicas[i % 3].BumpSessionVersionAsync(Ct), Ct)));
+
+        Assert.Equal(Enumerable.Range(2, 30).Select(v => (long)v), versions.Order());
+        Assert.Equal(31, (await Store.GetAdminAsync(Ct))!.SessionVersion);
     }
 
     [Fact]

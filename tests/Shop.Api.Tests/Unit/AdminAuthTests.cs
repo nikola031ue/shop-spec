@@ -49,6 +49,7 @@ public sealed class AdminAuthTests
         Assert.NotNull(next);
         Assert.True(next.Initial);
         Assert.Equal(2, next.FailedCount);
+        Assert.Equal(admin.SessionVersion + 1, next.SessionVersion);
         Assert.Equal(PasswordVerificationResult.Success, _hasher.VerifyHashedPassword(AdminUser.Instance, next.PasswordHash, "regenerated-password"));
     }
 
@@ -181,10 +182,22 @@ public sealed class AdminAuthTests
             return Task.CompletedTask;
         }
 
-        public Task SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct)
+        public Task<long> SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct)
         {
-            Admin = Admin! with { PasswordHash = passwordHash, Initial = false, ChangedAt = changedAt };
-            return Task.CompletedTask;
+            Admin = Admin! with
+            {
+                PasswordHash = passwordHash,
+                Initial = false,
+                ChangedAt = changedAt,
+                SessionVersion = Admin.SessionVersion + 1,
+            };
+            return Task.FromResult(Admin.SessionVersion);
+        }
+
+        public Task<long> BumpSessionVersionAsync(CancellationToken ct)
+        {
+            Admin = Admin! with { SessionVersion = Admin.SessionVersion + 1 };
+            return Task.FromResult(Admin.SessionVersion);
         }
 
         public Task InitializeAsync(Func<AdminRecord?, AdminRecord?> bootstrapAdmin, CancellationToken ct) => throw new NotSupportedException();
