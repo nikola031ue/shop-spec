@@ -25,7 +25,7 @@ appear in responses or logs.
 | `ADMIN_PASSWORD` | ✓ | Initial admin password (operator Secret `<shop>-admin`, key `password`) |
 | `DATABASE_URL` | one of these two | PostgreSQL URI, e.g. `postgresql://app:pw@host:5432/app` (CNPG Secret `<shop>-db-app`, key `uri`) |
 | `REDIS_URL` | one of these two | `redis://host:6379`, no credentials |
-| `REDIS_PASSWORD` | with `REDIS_URL` | Redis password (operator Secret `<shop>-redis-auth`) |
+| `REDIS_PASSWORD` | with `REDIS_URL` | Redis password (operator Secret `<shop>-redis-auth`; after the operator recovers a deleted Secret, `<shop>-redis-auth-<n>`, see the Redis resource's `redisSecret.name`) |
 | `ORDER_RATE_LIMIT_PER_MINUTE` | – | Orders per minute per client IP; default 10 |
 
 Missing or invalid settings stop the start with a message that names the variable, never its
@@ -57,6 +57,8 @@ Sessions:
 - **Lockout**: after 5 wrong passwords within 15 minutes, sign-in is refused for 15 minutes, even
   with the right password. The count is kept in the database, so it applies across replicas. There
   is no override: wait for the lock to expire.
+- **Headers**: every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Content-Security-Policy: frame-ancestors 'none'` and `Referrer-Policy: same-origin`.
 
 ## Order rules
 
@@ -123,8 +125,8 @@ tests/Shop.Api.Tests/ unit + Testcontainers integration tests
 ## Releases
 
 Images are published to `ghcr.io/nikola031ue/shop:X.Y.Z` by the `release` CI job when a `vX.Y.Z`
-tag is pushed on `main`. The job requires `lint` and `test` to pass, refuses non-SemVer tags and
-never overwrites an existing version or publishes `latest`.
+tag is pushed. The job requires `lint` and `test` to pass, and refuses tags that are not SemVer
+or whose commit is not on `main`. It never overwrites an existing version or publishes `latest`.
 
 To roll a release out, set `shopImage.tag` in kube-state `clusters/local/shop-operator/values.yaml`;
 shop-operator then rolls every Shop to the new image. `main` is protected: PRs only, CI

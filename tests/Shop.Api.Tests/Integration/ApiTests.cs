@@ -408,6 +408,29 @@ public abstract class ApiContract
         Assert.Equal(HttpStatusCode.BadRequest, badPage.StatusCode);
     }
 
+    /// <summary>T025 finding 4: security headers on success, problem and unauthenticated responses.</summary>
+    [Fact]
+    public async Task EveryResponseCarriesSecurityHeaders()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var anonymous = app.CreateClient();
+        foreach (var (path, status) in new[]
+        {
+            ("/api/shop", HttpStatusCode.OK),
+            ("/api/items?page=0", HttpStatusCode.BadRequest),
+            ("/api/admin/me", HttpStatusCode.Unauthorized),
+            ("/api/no-such-endpoint", HttpStatusCode.NotFound),
+        })
+        {
+            using var response = await anonymous.GetAsync(new Uri(path, UriKind.Relative), Ct);
+            Assert.Equal(status, response.StatusCode);
+            Assert.Equal("nosniff", Assert.Single(response.Headers.GetValues("X-Content-Type-Options")));
+            Assert.Equal("DENY", Assert.Single(response.Headers.GetValues("X-Frame-Options")));
+            Assert.Equal("frame-ancestors 'none'", Assert.Single(response.Headers.GetValues("Content-Security-Policy")));
+            Assert.Equal("same-origin", Assert.Single(response.Headers.GetValues("Referrer-Policy")));
+        }
+    }
+
     /// <summary>
     /// US2 scenario 4: the order is stored as PendingPayment with lines, total, time and the shop's
     /// wallet; stock goes down by exactly the ordered quantities; duplicates are merged.

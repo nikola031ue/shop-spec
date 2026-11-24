@@ -24,6 +24,7 @@ builder.Services.AddOrderRateLimit();
 
 var app = builder.Build();
 
+app.UseSecurityHeaders();
 app.UseShopErrorHandling();
 app.UseDefaultFiles();
 app.UseStaticFiles();
