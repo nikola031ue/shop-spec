@@ -104,7 +104,8 @@ public static class AdminEndpoints
         return Results.NoContent();
     }
 
-    private static async Task<IResult> ListItemsAsync(IShopStore store, CancellationToken ct, string? q = null, int page = 1)
+    /// <summary>Item list, shared by the public and admin APIs (same shape, contracts/http-api.md).</summary>
+    internal static async Task<IResult> ListItemsAsync(IShopStore store, CancellationToken ct, string? q = null, int page = 1)
     {
         if (page < 1)
         {

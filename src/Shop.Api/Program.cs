@@ -36,6 +36,7 @@ app.MapGet("/healthz", async (IShopStore store, CancellationToken ct) =>
     return Results.Ok(new { status = "ok" });
 });
 
+app.MapPublicEndpoints();
 app.MapAdminEndpoints();
 
 // Unknown API paths are 404s; every other path is a client route of the Angular app.
