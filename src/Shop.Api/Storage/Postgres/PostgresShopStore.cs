@@ -17,7 +17,7 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
     private const string ItemColumns = "id, name, stock, price_cents, created_at, updated_at";
     private const string OrderColumns = "reference, created_at, status, wallet_address, total_cents, lines";
     private const string AdminColumns =
-        "password_hash, initial, changed_at, failed_count, failed_window_start, locked_until";
+        "password_hash, initial, changed_at, failed_count, failed_window_start, locked_until, session_version";
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -58,9 +58,11 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             if (next is not null)
             {
                 await ExecuteAsync(conn, $"""
-                    INSERT INTO admin (id, {AdminColumns}) VALUES (1, @hash, @initial, @changed, @count, @start, @locked)
+                    INSERT INTO admin (id, {AdminColumns})
+                    VALUES (1, @hash, @initial, @changed, @count, @start, @locked, @version)
                     ON CONFLICT (id) DO UPDATE SET password_hash = @hash, initial = @initial, changed_at = @changed,
-                        failed_count = @count, failed_window_start = @start, locked_until = @locked
+                        failed_count = @count, failed_window_start = @start, locked_until = @locked,
+                        session_version = @version
                     """, ct, AdminParameters(next));
             }
         }
@@ -276,16 +278,23 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             "UPDATE admin SET failed_count = 0, failed_window_start = NULL, locked_until = NULL WHERE id = 1", ct);
     }
 
-    public async Task SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct)
+    public async Task<long> SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct)
     {
         await using var conn = await _dataSource.OpenConnectionAsync(ct);
-        var updated = await ExecuteAsync(conn,
-            "UPDATE admin SET password_hash = @hash, initial = false, changed_at = @at WHERE id = 1", ct,
-            ("hash", passwordHash), ("at", StoreTime.Truncate(changedAt)));
-        if (updated != 1)
-        {
-            throw new InvalidOperationException("The admin record is missing.");
-        }
+        await using var cmd = Command(conn, """
+            UPDATE admin SET password_hash = @hash, initial = false, changed_at = @at,
+                session_version = session_version + 1
+            WHERE id = 1 RETURNING session_version
+            """, ("hash", passwordHash), ("at", StoreTime.Truncate(changedAt)));
+        return await cmd.ExecuteScalarAsync(ct) as long? ?? throw new InvalidOperationException("The admin record is missing.");
+    }
+
+    public async Task<long> BumpSessionVersionAsync(CancellationToken ct)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await using var cmd = Command(conn,
+            "UPDATE admin SET session_version = session_version + 1 WHERE id = 1 RETURNING session_version");
+        return await cmd.ExecuteScalarAsync(ct) as long? ?? throw new InvalidOperationException("The admin record is missing.");
     }
 
     public async Task<IReadOnlyList<DataProtectionKey>> GetDataProtectionKeysAsync(CancellationToken ct)
@@ -342,13 +351,15 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             NullableTime(reader, 2),
             reader.GetInt32(3),
             NullableTime(reader, 4),
-            NullableTime(reader, 5));
+            NullableTime(reader, 5),
+            reader.GetInt64(6));
     }
 
     private static (string, object?)[] AdminParameters(AdminRecord a) =>
     [
         ("hash", a.PasswordHash), ("initial", a.Initial), ("changed", Time(a.ChangedAt)),
         ("count", a.FailedCount), ("start", Time(a.FailedWindowStart)), ("locked", Time(a.LockedUntil)),
+        ("version", a.SessionVersion),
     ];
 
     private static Item ReadItem(DbDataReader r) => new(

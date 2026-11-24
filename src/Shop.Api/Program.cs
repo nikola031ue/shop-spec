@@ -1,6 +1,7 @@
 // Shop application (spec 003). One image serves the API under /api and the Angular app from /.
 using Shop.Api;
 using Shop.Api.Auth;
+using Shop.Api.Endpoints;
 using Shop.Api.Storage;
 using Shop.Api.Storage.Postgres;
 using Shop.Api.Storage.Redis;
@@ -34,6 +35,8 @@ app.MapGet("/healthz", async (IShopStore store, CancellationToken ct) =>
     await store.PingAsync(ct);
     return Results.Ok(new { status = "ok" });
 });
+
+app.MapAdminEndpoints();
 
 // Unknown API paths are 404s; every other path is a client route of the Angular app.
 app.MapFallback("/api/{**path}", () => Results.Problem(statusCode: StatusCodes.Status404NotFound));

@@ -13,13 +13,21 @@ public sealed class PostgresContainer : IAsyncLifetime
 {
     public const string Image = "postgres:18.7";
 
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder(Image).Build();
+    private readonly PostgreSqlContainer _container;
+
+    public PostgresContainer()
+    {
+        _container = new PostgreSqlBuilder(Image).WithPassword(Password).Build();
+    }
+
+    /// <summary>A unique password, so log-leak checks can search for it.</summary>
+    public string Password { get; } = "pg-" + Guid.NewGuid().ToString("N");
 
     public string ConnectionString => _container.GetConnectionString();
 
     /// <summary>The CNPG-style URI the operator injects as <c>DATABASE_URL</c>.</summary>
-    public string DatabaseUrl(string database = "postgres") =>
-        $"postgresql://postgres:postgres@{_container.Hostname}:{_container.GetMappedPublicPort(5432)}/{database}";
+    public string DatabaseUrl(string database = "postgres", string? password = null) =>
+        $"postgresql://postgres:{password ?? Password}@{_container.Hostname}:{_container.GetMappedPublicPort(5432)}/{database}";
 
     public async ValueTask InitializeAsync() => await _container.StartAsync();
 

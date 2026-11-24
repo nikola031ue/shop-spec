@@ -51,8 +51,14 @@ public interface IShopStore
 
     Task ResetFailedSignInsAsync(CancellationToken ct);
 
-    /// <summary>Stores a new hash, sets <c>changedAt</c> and <c>initial=false</c>.</summary>
-    Task SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct);
+    /// <summary>
+    /// Stores a new hash, sets <c>changedAt</c> and <c>initial=false</c>, and atomically increments
+    /// the session version. Returns the new session version.
+    /// </summary>
+    Task<long> SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct);
+
+    /// <summary>Atomically increments the session version (sign-out) and returns the new value.</summary>
+    Task<long> BumpSessionVersionAsync(CancellationToken ct);
 
     Task<IReadOnlyList<DataProtectionKey>> GetDataProtectionKeysAsync(CancellationToken ct);
 
