@@ -9,6 +9,7 @@ import { AdminApi } from './admin-api';
   template: `
     <nav class="admin-nav">
       <a routerLink="items" routerLinkActive="active">Items</a>
+      <a routerLink="orders" routerLinkActive="active">Orders</a>
       <a routerLink="password" routerLinkActive="active">Password</a>
       <button type="button" class="link" (click)="signOut()">Sign out</button>
     </nav>

@@ -18,6 +18,30 @@ export interface ItemPage {
   total: number;
 }
 
+/** contracts/http-api.md admin order shape: lines are the snapshot taken at ordering time. */
+export interface OrderLine {
+  itemId: string;
+  name: string;
+  unitPriceCents: number;
+  quantity: number;
+}
+
+export interface Order {
+  reference: string;
+  createdAt: string;
+  status: string;
+  totalCents: number;
+  walletAddress: string;
+  lines: OrderLine[];
+}
+
+export interface OrderPage {
+  orders: Order[];
+  page: number;
+  pageSize: number;
+  total: number;
+}
+
 /** What the admin form sends: `price` is a decimal string with at most 2 decimals. */
 export interface ItemInput {
   name: string;
@@ -68,5 +92,9 @@ export class AdminApi {
 
   deleteItem(id: string): Promise<void> {
     return firstValueFrom(this.http.delete<void>(`/api/admin/items/${encodeURIComponent(id)}`));
+  }
+
+  orders(page: number): Promise<OrderPage> {
+    return firstValueFrom(this.http.get<OrderPage>('/api/admin/orders', { params: { page } }));
   }
 }
