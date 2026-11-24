@@ -13,6 +13,7 @@ namespace Shop.Api.Endpoints;
 public static class AdminEndpoints
 {
     public const int ItemPageSize = 50;
+    public const int OrderPageSize = 20;
 
     public static IEndpointRouteBuilder MapAdminEndpoints(this IEndpointRouteBuilder app)
     {
@@ -28,6 +29,7 @@ public static class AdminEndpoints
         admin.MapPost("/items", CreateItemAsync).RequireXsrf();
         admin.MapPut("/items/{id:guid}", UpdateItemAsync).RequireXsrf();
         admin.MapDelete("/items/{id:guid}", DeleteItemAsync).RequireXsrf();
+        admin.MapGet("/orders", ListOrdersAsync);
         return app;
     }
 
@@ -45,6 +47,22 @@ public static class AdminEndpoints
     public sealed record ItemPageDto(IReadOnlyList<ItemDto> Items, int Page, int PageSize, long Total);
 
     public sealed record MeDto(bool InitialPassword);
+
+    public sealed record OrderLineDto(Guid ItemId, string Name, long UnitPriceCents, int Quantity);
+
+    public sealed record OrderDto(
+        string Reference,
+        DateTimeOffset CreatedAt,
+        string Status,
+        long TotalCents,
+        string WalletAddress,
+        IReadOnlyList<OrderLineDto> Lines)
+    {
+        public static OrderDto From(Order o) => new(o.Reference, o.CreatedAt, o.Status, o.TotalCents, o.WalletAddress,
+            o.Lines.Select(l => new OrderLineDto(l.ItemId, l.Name, l.UnitPriceCents, l.Quantity)).ToList());
+    }
+
+    public sealed record OrderPageDto(IReadOnlyList<OrderDto> Orders, int Page, int PageSize, long Total);
 
     private static async Task<IResult> LoginAsync(
         LoginRequest request, AdminAuth auth, HttpContext context, CancellationToken ct)
@@ -151,6 +169,18 @@ public static class AdminEndpoints
 
     private static async Task<IResult> DeleteItemAsync(Guid id, IShopStore store, CancellationToken ct) =>
         await store.DeleteItemAsync(id, ct) ? Results.NoContent() : ItemNotFound();
+
+    /// <summary>US3: all orders newest first, 20 per page, with the lines as stored at ordering time.</summary>
+    private static async Task<IResult> ListOrdersAsync(IShopStore store, CancellationToken ct, int page = 1)
+    {
+        if (page < 1)
+        {
+            return Results.ValidationProblem(new Dictionary<string, string[]> { ["page"] = ["Page must be 1 or more."] });
+        }
+
+        var result = await store.ListOrdersAsync(page, OrderPageSize, ct);
+        return Results.Ok(new OrderPageDto(result.Items.Select(OrderDto.From).ToList(), page, OrderPageSize, result.Total));
+    }
 
     private static IResult ItemNotFound() =>
         Results.Problem(statusCode: StatusCodes.Status404NotFound, title: "Item not found.");

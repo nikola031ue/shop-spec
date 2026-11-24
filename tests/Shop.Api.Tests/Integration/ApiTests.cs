@@ -74,6 +74,13 @@ public sealed record MeJson(bool InitialPassword);
 
 public sealed record PlacedJson(string Reference, string Status, long TotalCents, DateTimeOffset CreatedAt);
 
+public sealed record OrderLineJson(Guid ItemId, string Name, long UnitPriceCents, int Quantity);
+
+public sealed record OrderJson(
+    string Reference, DateTimeOffset CreatedAt, string Status, long TotalCents, string WalletAddress, List<OrderLineJson> Lines);
+
+public sealed record OrderPageJson(List<OrderJson> Orders, int Page, int PageSize, long Total);
+
 /// <summary>
 /// US1 scenarios 1–6 and the admin security requirements through HTTP, once per store
 /// (contracts/http-api.md "Admin"). Each test gets an empty database.
@@ -195,6 +202,7 @@ public abstract class ApiContract
             (HttpMethod.Delete, $"/api/admin/items/{item.Id}", null),
             (HttpMethod.Post, "/api/admin/password", new { currentPassword = ShopApp.AdminPassword, newPassword = NewPassword }),
             (HttpMethod.Post, "/api/admin/logout", null),
+            (HttpMethod.Get, "/api/admin/orders", null),
         };
         foreach (var (method, path, body) in attempts)
         {
@@ -585,6 +593,98 @@ public abstract class ApiContract
 
         Assert.Equal(4, (await app.Services.GetRequiredService<IShopStore>().ListOrdersAsync(1, 20, Ct)).Total);
         Assert.Equal(96, (await app.Services.GetRequiredService<IShopStore>().GetItemAsync(item.Id, Ct))!.Stock);
+    }
+
+    // ---- Admin order list (US3) ----
+
+    private static async Task<List<string>> SeedOrdersAsync(ShopApp app, Guid itemId, int count)
+    {
+        // Seeded through the store with distinct times: the public endpoint is rate-limited.
+        var store = app.Services.GetRequiredService<IShopStore>();
+        var t0 = new DateTimeOffset(2026, 11, 24, 8, 0, 0, TimeSpan.Zero);
+        var references = new List<string>();
+        for (var i = 0; i < count; i++)
+        {
+            var placed = await store.PlaceOrderAsync(new NewOrder(OrderReference.New(), t0.AddMinutes(i),
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", [new OrderRequestLine(itemId, 1, 100)]), Ct);
+            references.Add(placed.Order!.Reference);
+        }
+
+        return references;
+    }
+
+    private static async Task<OrderPageJson> OrdersAsync(AdminClient admin, int page = 1) =>
+        await admin.GetJsonAsync<OrderPageJson>($"/api/admin/orders?page={page}");
+
+    /// <summary>US3 scenario 1: three orders, newest first, with reference, time, status, total and lines.</summary>
+    [Fact]
+    public async Task AdminListsOrdersNewestFirst()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 100, "1");
+
+        var references = await SeedOrdersAsync(app, item.Id, 3);
+        var page = await OrdersAsync(admin);
+
+        Assert.Equal(3, page.Total);
+        Assert.Equal(20, page.PageSize);
+        Assert.Equal(Enumerable.Reverse(references), page.Orders.Select(o => o.Reference));
+        var newest = page.Orders[0];
+        Assert.Equal("PendingPayment", newest.Status);
+        Assert.Equal(new DateTimeOffset(2026, 11, 24, 8, 2, 0, TimeSpan.Zero), newest.CreatedAt);
+        Assert.Equal(100, newest.TotalCents);
+        Assert.Equal("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", newest.WalletAddress);
+        Assert.Equal([new OrderLineJson(item.Id, "Shirt", 100, 1)], newest.Lines);
+
+        using var badPage = await admin.SendAsync(HttpMethod.Get, "/api/admin/orders?page=0");
+        Assert.Equal(HttpStatusCode.BadRequest, badPage.StatusCode);
+    }
+
+    /// <summary>US3 scenario 2: 45 orders → pages of 20, 20 and 5, every order exactly once.</summary>
+    [Fact]
+    public async Task OrderPagesContainEveryOrderOnce()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 100, "1");
+        var references = await SeedOrdersAsync(app, item.Id, 45);
+
+        var pages = new List<OrderPageJson>();
+        for (var p = 1; p <= 4; p++)
+        {
+            pages.Add(await OrdersAsync(admin, p));
+        }
+
+        Assert.Equal([20, 20, 5, 0], pages.Select(p => p.Orders.Count));
+        Assert.All(pages, p => Assert.Equal(45, p.Total));
+        var listed = pages.SelectMany(p => p.Orders.Select(o => o.Reference)).ToList();
+        Assert.Equal(Enumerable.Reverse(references), listed);
+        Assert.Equal(45, listed.Distinct().Count());
+    }
+
+    /// <summary>US3 scenario 3: an order keeps the name and price at ordering time after a rename, reprice or delete.</summary>
+    [Fact]
+    public async Task OrdersShowSnapshotAfterItemChanges()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var admin = await SignedInAsync(app);
+        var shirt = await CreateAsync(admin, "Blue T-shirt", 10, "15.00");
+        var cap = await CreateAsync(admin, "Red cap", 10, "5.50");
+        using var customer = app.CreateClient();
+        using var placed = await OrderAsync(customer,
+            new { itemId = shirt.Id, quantity = 2, unitPriceCents = 1500 },
+            new { itemId = cap.Id, quantity = 1, unitPriceCents = 550 });
+        Assert.Equal(HttpStatusCode.Created, placed.StatusCode);
+
+        (await admin.SendAsync(HttpMethod.Put, $"/api/admin/items/{shirt.Id}", new { name = "Navy T-shirt", stock = 8, price = "19.99" })).Dispose();
+        (await admin.SendAsync(HttpMethod.Delete, $"/api/admin/items/{cap.Id}")).Dispose();
+
+        var order = (await OrdersAsync(admin)).Orders.Single();
+        Assert.Equal(
+            [new OrderLineJson(shirt.Id, "Blue T-shirt", 1500, 2), new OrderLineJson(cap.Id, "Red cap", 550, 1)],
+            order.Lines);
+        Assert.Equal(3550, order.TotalCents);
     }
 
     /// <summary>FR-005: the changed password replaces the generated one and survives a restart.</summary>

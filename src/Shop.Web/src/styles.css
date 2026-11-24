@@ -67,3 +67,8 @@ tr.unavailable td { color: var(--muted); }
 .qty { width: 5rem; }
 .checkout { margin-top: 1rem; }
 .reference { font-family: ui-monospace, monospace; font-size: 1.5rem; letter-spacing: 0.1em; }
+
+.mono { font-family: ui-monospace, monospace; }
+.muted { color: var(--muted); font-size: 0.9rem; }
+tr.lines > td { background: var(--bg); }
+tr.lines table { margin-top: 0; }
