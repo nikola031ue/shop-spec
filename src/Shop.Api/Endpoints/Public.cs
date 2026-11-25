@@ -13,13 +13,20 @@ public static class PublicEndpoints
     public static IEndpointRouteBuilder MapPublicEndpoints(this IEndpointRouteBuilder app)
     {
         var api = app.MapGroup("/api");
-        api.MapGet("/shop", (Settings settings) => Results.Ok(new ShopDto(settings.ShopName)));
+        api.MapGet("/shop", GetShopAsync);
         api.MapGet("/items", AdminEndpoints.ListItemsAsync);
         api.MapPost("/orders", PlaceOrderAsync).RequireRateLimiting(OrderRateLimit.Policy);
         return app;
     }
 
-    public sealed record ShopDto(string Name);
+    /// <summary>
+    /// <see cref="AdminPasswordChanged"/> is false while the operator-generated password is still the
+    /// admin password (ShopHub's admin hand-off, spec 004 FR-016).
+    /// </summary>
+    public sealed record ShopDto(string Name, bool AdminPasswordChanged);
+
+    private static async Task<IResult> GetShopAsync(Settings settings, IShopStore store, CancellationToken ct) =>
+        Results.Ok(new ShopDto(settings.ShopName, await store.GetAdminAsync(ct) is { Initial: false }));
 
     public sealed record OrderLineRequest(Guid ItemId, int Quantity, long UnitPriceCents);
 

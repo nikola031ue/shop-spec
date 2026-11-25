@@ -26,11 +26,23 @@ appear in responses or logs.
 | `DATABASE_URL` | one of these two | PostgreSQL URI, e.g. `postgresql://app:pw@host:5432/app` (CNPG Secret `<shop>-db-app`, key `uri`) |
 | `REDIS_URL` | one of these two | `redis://host:6379`, no credentials |
 | `REDIS_PASSWORD` | with `REDIS_URL` | Redis password (operator Secret `<shop>-redis-auth`; after the operator recovers a deleted Secret, `<shop>-redis-auth-<n>`, see the Redis resource's `redisSecret.name`) |
-| `ORDER_RATE_LIMIT_PER_MINUTE` | – | Orders per minute per client IP; default 10 |
+| `TRUSTED_PROXY_HOST` | – | DNS name of the entry point's pods (shop-operator 0.3.0+ sets `traefik-proxies.traefik.svc.cluster.local`). See [Client address](#client-address) |
+| `ORDER_RATE_LIMIT_PER_MINUTE` | – | Orders per minute per client address; default 10 |
 
 Missing or invalid settings stop the start with a message that names the variable, never its
 value. Until the database answers, the app does not open port 80, so the operator's readiness
 probe waits.
+
+## Client address
+
+Lockouts and order limits are keyed by the client's address (since 0.2.0).
+
+- The app resolves `TRUSTED_PROXY_HOST` at start and then every 30 s. `X-Forwarded-For` and
+  `X-Forwarded-Proto` are honoured only when the TCP peer is one of those addresses, and only
+  their last value, the one the proxy added.
+- Requests from any other peer keep their peer address, even from inside the cluster (ShopHub
+  reads `GET /api/shop` directly and can't choose an address).
+- Unset, or a failed lookup, means no proxy is trusted until the next successful lookup.
 
 ## The admin password
 
@@ -51,12 +63,19 @@ probe waits.
 
 Sessions:
 
-- **Sign-in**: an HttpOnly, `SameSite=Strict` cookie, valid for 8 hours. It works on every
+- **Sign-in**: an HttpOnly, `SameSite=Strict`, always `Secure` cookie, valid for 8 hours. Every
+  cookie the app writes is `Secure`, so use HTTPS (browsers also accept `Secure` cookies on
+  `http://localhost`). It works on every
   replica, because the cookie keys are kept in the shop's database.
 - **Sign-out and password change** end every admin session: a copied cookie stops working.
-- **Lockout**: after 5 wrong passwords within 15 minutes, sign-in is refused for 15 minutes, even
-  with the right password. The count is kept in the database, so it applies across replicas. There
-  is no override: wait for the lock to expire.
+- **Lockout**: after 5 wrong passwords from one client address within 15 minutes, sign-in from
+  that address is refused for 15 minutes, even with the right password; other addresses can still
+  sign in. Across all addresses, 50 wrong passwords within 15 minutes lock sign-in for the whole
+  shop for 15 minutes. Counts are kept in the database, so they apply across replicas. There is
+  no override: wait for the lock to expire.
+- **Hand-off**: `GET /api/shop` returns `{name, adminPasswordChanged}`; `adminPasswordChanged` is
+  false while the generated password is still in use (ShopHub shows it to the shop's owner only
+  then).
 - **Headers**: every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Content-Security-Policy: frame-ancestors 'none'` and `Referrer-Policy: same-origin`.
 
@@ -66,7 +85,7 @@ Sessions:
   compared: if it changed, the order is refused (409) and the cart shows the difference.
 - Stock goes down when the order is placed, in the same step that stores it. It is not given back
   for unpaid orders yet (spec 005).
-- At most 50 lines and 1,000 pieces per item per order. Order placement is limited per client IP
+- At most 50 lines and 1,000 pieces per item per order. Order placement is limited per client address
   (`ORDER_RATE_LIMIT_PER_MINUTE`), with 429 and `Retry-After` beyond it.
 
 ## Run locally

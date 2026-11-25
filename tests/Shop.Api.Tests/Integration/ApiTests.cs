@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Shop.Api.Auth;
 using Shop.Api.Domain;
 using Shop.Api.Storage;
 using StackExchange.Redis;
@@ -80,6 +81,18 @@ public sealed record OrderJson(
     string Reference, DateTimeOffset CreatedAt, string Status, long TotalCents, string WalletAddress, List<OrderLineJson> Lines);
 
 public sealed record OrderPageJson(List<OrderJson> Orders, int Page, int PageSize, long Total);
+
+public sealed record ShopJson(string Name, bool AdminPasswordChanged);
+
+/// <summary>Stands in for DNS: <c>TRUSTED_PROXY_HOST</c> resolves to the given addresses, or fails.</summary>
+public sealed class StaticResolver(params string[] addresses) : IHostResolver
+{
+    public bool Fail { get; init; }
+
+    public Task<IPAddress[]> ResolveAsync(string host, CancellationToken ct) => Fail
+        ? throw new System.Net.Sockets.SocketException(11001)
+        : Task.FromResult(addresses.Select(IPAddress.Parse).ToArray());
+}
 
 /// <summary>
 /// US1 scenarios 1–6 and the admin security requirements through HTTP, once per store
@@ -616,6 +629,180 @@ public abstract class ApiContract
 
         Assert.Equal(4, (await app.Services.GetRequiredService<IShopStore>().ListOrdersAsync(1, 20, Ct)).Total);
         Assert.Equal(96, (await app.Services.GetRequiredService<IShopStore>().GetItemAsync(item.Id, Ct))!.Stock);
+    }
+
+    // ---- Real client address, lockout per address, Secure cookies (spec 004 FR-022 to FR-025) ----
+
+    private const string TraefikPod = "10.244.0.64";
+
+    /// <summary>A pod in the pod network that is not Traefik, e.g. ShopHub, which the NetworkPolicy admits.</summary>
+    private const string ShopHubPod = "10.244.0.99";
+
+    private static async Task<Dictionary<string, string?>> ProxiedEnvAsync(Task<Dictionary<string, string?>> fresh)
+    {
+        var env = await fresh;
+        env["TRUSTED_PROXY_HOST"] = "traefik-proxies.traefik.svc.cluster.local";
+        env["ORDER_RATE_LIMIT_PER_MINUTE"] = "1";
+        return env;
+    }
+
+    /// <summary>A request from TCP peer <paramref name="peer"/> claiming client <paramref name="forwardedFor"/>.</summary>
+    private static HttpClient FromPeer(ShopApp app, string peer, string? forwardedFor = null)
+    {
+        var client = app.CreateClient();
+        client.DefaultRequestHeaders.Add(ShopApp.ClientIpHeader, peer);
+        if (forwardedFor is not null)
+        {
+            client.DefaultRequestHeaders.Add("X-Forwarded-For", forwardedFor);
+        }
+
+        return client;
+    }
+
+    private static async Task<HttpStatusCode> OrderFromAsync(ShopApp app, Guid itemId, string peer, string forwardedFor)
+    {
+        using var client = FromPeer(app, peer, forwardedFor);
+        using var response = await OrderAsync(client, new { itemId, quantity = 1, unitPriceCents = 100 });
+        return response.StatusCode;
+    }
+
+    /// <summary>FR-022, FR-024: through Traefik, each forwarded client address gets its own order limit.</summary>
+    [Fact]
+    public async Task ForwardedAddressFromTraefikIsTheClient()
+    {
+        await using var app = new ShopApp(await ProxiedEnvAsync(FreshEnvAsync()), resolver: new StaticResolver(TraefikPod));
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 100, "1");
+
+        Assert.Equal(HttpStatusCode.Created, await OrderFromAsync(app, item.Id, TraefikPod, "203.0.113.7"));
+        Assert.Equal(HttpStatusCode.Created, await OrderFromAsync(app, item.Id, TraefikPod, "198.51.100.9"));
+        Assert.Equal((HttpStatusCode)429, await OrderFromAsync(app, item.Id, TraefikPod, "203.0.113.7"));
+        // Only the last value counts: the one Traefik appended.
+        Assert.Equal((HttpStatusCode)429, await OrderFromAsync(app, item.Id, TraefikPod, "192.0.2.1, 198.51.100.9"));
+    }
+
+    /// <summary>FR-022: a pod inside the pod network that isn't Traefik (ShopHub) can't choose its address.</summary>
+    [Fact]
+    public async Task ForwardedHeaderFromOtherPodsIsIgnored()
+    {
+        await using var app = new ShopApp(await ProxiedEnvAsync(FreshEnvAsync()), resolver: new StaticResolver(TraefikPod));
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 100, "1");
+
+        Assert.Equal(HttpStatusCode.Created, await OrderFromAsync(app, item.Id, ShopHubPod, "203.0.113.7"));
+        Assert.Equal((HttpStatusCode)429, await OrderFromAsync(app, item.Id, ShopHubPod, "198.51.100.9"));
+
+        // Five failed sign-ins with ever-new forwarded addresses still lock the pod's own address.
+        for (var i = 0; i < 5; i++)
+        {
+            using var wrong = new AdminClient(FromPeer(app, ShopHubPod, $"192.0.2.{i}"));
+            using var response = await wrong.LoginAsync("wrong-" + i);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        }
+
+        using var spoofer = new AdminClient(FromPeer(app, ShopHubPod, "192.0.2.200"));
+        using var locked = await spoofer.LoginAsync(ShopApp.AdminPassword);
+        Assert.Equal((HttpStatusCode)429, locked.StatusCode);
+    }
+
+    /// <summary>FR-022: a failed TRUSTED_PROXY_HOST lookup trusts nobody (fail closed).</summary>
+    [Fact]
+    public async Task ForwardedHeaderIsIgnoredWhenTheLookupFails()
+    {
+        await using var app = new ShopApp(await ProxiedEnvAsync(FreshEnvAsync()),
+            resolver: new StaticResolver(TraefikPod) { Fail = true });
+        using var admin = await SignedInAsync(app);
+        var item = await CreateAsync(admin, "Shirt", 100, "1");
+
+        Assert.Equal(HttpStatusCode.Created, await OrderFromAsync(app, item.Id, TraefikPod, "203.0.113.7"));
+        Assert.Equal((HttpStatusCode)429, await OrderFromAsync(app, item.Id, TraefikPod, "198.51.100.9"));
+    }
+
+    /// <summary>FR-023: through Traefik, a lock applies to the client address that failed, not to others.</summary>
+    [Fact]
+    public async Task LockoutIsPerClientAddress()
+    {
+        await using var app = new ShopApp(await ProxiedEnvAsync(FreshEnvAsync()), resolver: new StaticResolver(TraefikPod));
+        using var attacker = new AdminClient(FromPeer(app, TraefikPod, "203.0.113.7"));
+        for (var i = 0; i < 5; i++)
+        {
+            using var wrong = await attacker.LoginAsync("wrong-" + i);
+            Assert.Equal(HttpStatusCode.Unauthorized, wrong.StatusCode);
+        }
+
+        using var locked = await attacker.LoginAsync(ShopApp.AdminPassword);
+        Assert.Equal((HttpStatusCode)429, locked.StatusCode);
+
+        using var owner = new AdminClient(FromPeer(app, TraefikPod, "198.51.100.9"));
+        using var signedIn = await owner.LoginAsync(ShopApp.AdminPassword);
+        Assert.Equal(HttpStatusCode.NoContent, signedIn.StatusCode);
+    }
+
+    /// <summary>
+    /// FR-023: a burst of concurrent wrong passwords from one address locks that address only; the
+    /// shop-wide ceiling isn't reached and another address still signs in.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentFailuresFromOneAddressDoNotLockTheShop()
+    {
+        await using var app = new ShopApp(await ProxiedEnvAsync(FreshEnvAsync()), resolver: new StaticResolver(TraefikPod));
+        using var http = FromPeer(app, TraefikPod, "203.0.113.7");
+
+        var statuses = await Task.WhenAll(Enumerable.Range(0, 60).Select(async i =>
+        {
+            using var response = await http.PostAsJsonAsync(new Uri("/api/admin/login", UriKind.Relative),
+                new { password = "wrong-" + i }, Ct);
+            return response.StatusCode;
+        }));
+
+        Assert.All(statuses, s => Assert.True(s is HttpStatusCode.Unauthorized or (HttpStatusCode)429, s.ToString()));
+        var lockout = await app.Services.GetRequiredService<IShopStore>().GetLockoutAsync(AdminAuth.Account, "203.0.113.7", Ct);
+        Assert.True(lockout.Scope.IsLocked(DateTimeOffset.UtcNow, out _));
+        Assert.False(lockout.ShopWide.IsLocked(DateTimeOffset.UtcNow, out _));
+        Assert.True(lockout.ShopWide.FailedCount <= 5, $"shop-wide count {lockout.ShopWide.FailedCount}");
+
+        using var owner = new AdminClient(FromPeer(app, TraefikPod, "198.51.100.9"));
+        using var signedIn = await owner.LoginAsync(ShopApp.AdminPassword);
+        Assert.Equal(HttpStatusCode.NoContent, signedIn.StatusCode);
+    }
+
+    /// <summary>FR-025: session, anti-forgery and XSRF cookies are Secure even on a plain-HTTP request.</summary>
+    [Fact]
+    public async Task CookiesAreAlwaysSecure()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var http = app.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("http://localhost"),
+            HandleCookies = false,
+        });
+
+        using var login = await http.PostAsJsonAsync(new Uri("/api/admin/login", UriKind.Relative),
+            new { password = ShopApp.AdminPassword }, Ct);
+
+        Assert.Equal(HttpStatusCode.NoContent, login.StatusCode);
+        var cookies = login.Headers.GetValues("Set-Cookie").ToList();
+        foreach (var name in new[] { "shop.session", "shop.af", "XSRF-TOKEN" })
+        {
+            var cookie = Assert.Single(cookies, c => c.StartsWith(name + "=", StringComparison.Ordinal));
+            Assert.Contains("secure", cookie, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>FR-016 hand-off: GET /api/shop says whether the generated admin password is still in use.</summary>
+    [Fact]
+    public async Task ShopReportsWhetherTheAdminPasswordChanged()
+    {
+        await using var app = new ShopApp(await FreshEnvAsync());
+        using var anonymous = app.CreateClient();
+        Assert.Equal(new ShopJson("Acme", false), await anonymous.GetFromJsonAsync<ShopJson>("/api/shop", Ct));
+
+        using var admin = await SignedInAsync(app);
+        using var change = await admin.SendAsync(HttpMethod.Post, "/api/admin/password",
+            new { currentPassword = ShopApp.AdminPassword, newPassword = "a-brand-new-password" });
+        Assert.Equal(HttpStatusCode.NoContent, change.StatusCode);
+
+        Assert.Equal(new ShopJson("Acme", true), await anonymous.GetFromJsonAsync<ShopJson>("/api/shop", Ct));
     }
 
     // ---- Admin order list (US3) ----

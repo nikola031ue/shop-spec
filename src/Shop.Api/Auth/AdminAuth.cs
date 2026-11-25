@@ -36,14 +36,18 @@ public enum ChangePasswordStatus
 
 /// <summary>
 /// The single admin account (research R11): bootstrap from <c>ADMIN_PASSWORD</c>, PBKDF2 hashes via
-/// <see cref="PasswordHasher{TUser}"/>, lockout held in the store so it applies across replicas.
+/// <see cref="PasswordHasher{TUser}"/>, lockout held in the store so it applies across replicas,
+/// keyed by (account, client address) with a shop-wide ceiling (spec 004 FR-023).
 /// </summary>
 public sealed class AdminAuth(IShopStore store, IPasswordHasher<AdminUser> hasher, TimeProvider time)
 {
     public const int MinPasswordLength = 12;
     public const string Policy = "admin";
 
-    public static LockoutPolicy Lockout => LockoutPolicy.Default;
+    /// <summary>The lockout account of the shop's single admin.</summary>
+    public const string Account = "admin";
+
+    public static LockoutRules Lockout => LockoutRules.Default;
 
     /// <summary>
     /// Admin bootstrap rules, run under the store's init lock:
@@ -55,7 +59,7 @@ public sealed class AdminAuth(IShopStore store, IPasswordHasher<AdminUser> hashe
     {
         if (existing is null)
         {
-            return new AdminRecord(hasher.HashPassword(AdminUser.Instance, adminPassword), true, null, 0, null, null);
+            return new AdminRecord(hasher.HashPassword(AdminUser.Instance, adminPassword), true, null);
         }
 
         if (!existing.Initial || Verify(hasher, existing.PasswordHash, adminPassword))
@@ -72,29 +76,31 @@ public sealed class AdminAuth(IShopStore store, IPasswordHasher<AdminUser> hashe
     }
 
     /// <summary>
-    /// Checks the password unless sign-in is locked. A wrong password counts towards the lockout;
-    /// the attempt that triggers the lock still reports <see cref="SignInStatus.WrongPassword"/>.
+    /// Checks the password unless sign-in is locked for this (account, <paramref name="address"/>) or
+    /// shop-wide. A wrong password counts towards both scopes; the attempt that triggers a lock still
+    /// reports <see cref="SignInStatus.WrongPassword"/>. Success clears only this address's scope.
     /// </summary>
-    public async Task<SignInResult> SignInAsync(string? password, CancellationToken ct)
+    public async Task<SignInResult> SignInAsync(string? password, string address, CancellationToken ct)
     {
         var now = time.GetUtcNow();
         var admin = await store.GetAdminAsync(ct) ?? throw new InvalidOperationException("The admin record is missing.");
-        if (Lockout.IsLocked(admin, now, out var retryAfter))
+        var lockout = await store.GetLockoutAsync(Account, address, ct);
+        if (lockout.IsLocked(now, out var retryAfter))
         {
             return new SignInResult(SignInStatus.Locked, retryAfter);
         }
 
         if (!string.IsNullOrEmpty(password) && Verify(hasher, admin.PasswordHash, password))
         {
-            if (admin.FailedCount > 0 || admin.FailedWindowStart is not null || admin.LockedUntil is not null)
+            if (lockout.Scope != LockoutScope.Empty)
             {
-                await store.ResetFailedSignInsAsync(ct);
+                await store.ResetFailedSignInsAsync(Account, address, ct);
             }
 
             return new SignInResult(SignInStatus.Success, SessionVersion: admin.SessionVersion);
         }
 
-        await store.RecordFailedSignInAsync(Lockout, now, ct);
+        await store.RecordFailedSignInAsync(Lockout, Account, address, now, ct);
         return new SignInResult(SignInStatus.WrongPassword);
     }
 
@@ -196,7 +202,8 @@ public static class AdminAuthSetup
                 o.Cookie.Name = SessionCookie;
                 o.Cookie.HttpOnly = true;
                 o.Cookie.SameSite = SameSiteMode.Strict;
-                o.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+                // Always Secure (spec 004 FR-025): shops are served over HTTPS by the entry point.
+                o.Cookie.SecurePolicy = CookieSecurePolicy.Always;
                 o.ExpireTimeSpan = TimeSpan.FromHours(8);
                 o.SlidingExpiration = false;
                 o.Events.OnValidatePrincipal = ValidateSessionVersionAsync;
@@ -214,12 +221,18 @@ public static class AdminAuthSetup
         services.AddAuthorizationBuilder()
             .AddPolicy(AdminAuth.Policy, p => p.RequireAuthenticatedUser());
 
+        // Every cookie the app writes is Secure, whatever the request scheme (spec 004 FR-025).
+        services.Configure<CookiePolicyOptions>(o => o.Secure = CookieSecurePolicy.Always);
+
         services.AddAntiforgery(o =>
         {
             o.HeaderName = XsrfHeader;
             o.Cookie.Name = "shop.af";
             o.Cookie.HttpOnly = true;
             o.Cookie.SameSite = SameSiteMode.Strict;
+            // SameAsRequest here: with Always, antiforgery throws on plain-HTTP requests (Traefik to
+            // the pod, or a failed TRUSTED_PROXY_HOST lookup). The cookie policy below still marks
+            // the cookie Secure on every response (spec 004 FR-025).
             o.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
         });
         return services;
@@ -236,7 +249,7 @@ public static class AdminAuthSetup
         {
             HttpOnly = false,
             SameSite = SameSiteMode.Strict,
-            Secure = context.Request.IsHttps,
+            Secure = true,
             Path = "/",
         });
     }

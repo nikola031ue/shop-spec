@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Shop.Api;
 using Shop.Api.Auth;
 using Shop.Api.Storage;
 
@@ -15,12 +16,31 @@ namespace Shop.Api.Tests.Integration;
 /// The app with the operator's environment variables set, as a pod would get them. All log output
 /// (Debug and up) goes to <paramref name="logs"/> when given, for the FR-024 leak checks.
 /// </summary>
-public sealed class ShopApp(
-    IReadOnlyDictionary<string, string?> env,
-    LogSink? logs = null,
-    TimeSpan? startupTimeout = null) : WebApplicationFactory<Program>
+public sealed class ShopApp : WebApplicationFactory<Program>
 {
     public const string AdminPassword = "generated-admin-password";
+
+    private readonly IReadOnlyDictionary<string, string?> env;
+    private readonly LogSink? logs;
+    private readonly TimeSpan? startupTimeout;
+    private readonly IHostResolver? resolver;
+
+    /// <param name="resolver">Replaces DNS for <c>TRUSTED_PROXY_HOST</c> (spec 004 FR-022 tests).</param>
+    public ShopApp(
+        IReadOnlyDictionary<string, string?> env,
+        LogSink? logs = null,
+        TimeSpan? startupTimeout = null,
+        IHostResolver? resolver = null)
+    {
+        this.env = env;
+        this.logs = logs;
+        this.startupTimeout = startupTimeout;
+        this.resolver = resolver;
+
+        // Cookies are always Secure (spec 004 FR-025); the client talks HTTPS like a browser
+        // behind the entry point, so its cookie jar sends them back.
+        ClientOptions.BaseAddress = new Uri("https://localhost");
+    }
 
     public static Dictionary<string, string?> BaseEnv() => new()
     {
@@ -46,7 +66,12 @@ public sealed class ShopApp(
             builder.ConfigureServices(s => s.Configure<HostOptions>(o => o.StartupTimeout = timeout));
         }
 
-        // TestServer has no peer address; this test-only header simulates distinct client IPs.
+        if (resolver is not null)
+        {
+            builder.ConfigureServices(s => s.AddSingleton(resolver));
+        }
+
+        // TestServer has no peer address; this test-only header simulates the TCP peer.
         builder.ConfigureServices(s => s.AddSingleton<IStartupFilter, TestClientIpFilter>());
     }
 
