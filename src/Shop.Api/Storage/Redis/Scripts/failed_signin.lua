@@ -1,16 +1,23 @@
 -- One failed admin sign-in, applied atomically to the (account, address) scope and the shop-wide
--- scope. Mirrors LockoutPolicy.ApplyFailure (Domain/Admin.cs) for each scope.
+-- scope. Mirrors LockoutState.ApplyFailure and LockoutPolicy.ApplyFailure (Domain/Admin.cs).
 -- KEYS[1] shop:admin:lock:<account>:<address>  KEYS[2] shop:admin:lock:*
 -- ARGV[1] now (ms)
 -- ARGV[2..5] scope:      window (ms), max failures, lock duration (ms), retention (ms)
 -- ARGV[6..9] shop-wide:  window (ms), max failures, lock duration (ms), retention (ms)
 local now = tonumber(ARGV[1])
 
+local function locked(key)
+  local untilMs = tonumber(redis.call('HGET', key, 'lockedUntil') or '')
+  return untilMs ~= nil and untilMs > now
+end
+
+-- An attempt while either scope is locked counts nowhere (LockoutState.ApplyFailure): concurrent
+-- requests from one locked address must not add up to the shop-wide ceiling.
+if locked(KEYS[1]) or locked(KEYS[2]) then
+  return 'locked'
+end
+
 local function apply(key, window, max, lockfor, retention)
-  local locked = tonumber(redis.call('HGET', key, 'lockedUntil') or '')
-  if locked and locked > now then
-    return
-  end
   local start = tonumber(redis.call('HGET', key, 'failedWindowStart') or '')
   local count = tonumber(redis.call('HGET', key, 'failedCount') or '') or 0
   if (not start) or (now - start >= window) then

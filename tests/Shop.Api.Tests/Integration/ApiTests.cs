@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Shop.Api.Auth;
 using Shop.Api.Domain;
 using Shop.Api.Storage;
 using StackExchange.Redis;
@@ -731,6 +732,34 @@ public abstract class ApiContract
 
         using var locked = await attacker.LoginAsync(ShopApp.AdminPassword);
         Assert.Equal((HttpStatusCode)429, locked.StatusCode);
+
+        using var owner = new AdminClient(FromPeer(app, TraefikPod, "198.51.100.9"));
+        using var signedIn = await owner.LoginAsync(ShopApp.AdminPassword);
+        Assert.Equal(HttpStatusCode.NoContent, signedIn.StatusCode);
+    }
+
+    /// <summary>
+    /// FR-023: a burst of concurrent wrong passwords from one address locks that address only; the
+    /// shop-wide ceiling isn't reached and another address still signs in.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentFailuresFromOneAddressDoNotLockTheShop()
+    {
+        await using var app = new ShopApp(await ProxiedEnvAsync(FreshEnvAsync()), resolver: new StaticResolver(TraefikPod));
+        using var http = FromPeer(app, TraefikPod, "203.0.113.7");
+
+        var statuses = await Task.WhenAll(Enumerable.Range(0, 60).Select(async i =>
+        {
+            using var response = await http.PostAsJsonAsync(new Uri("/api/admin/login", UriKind.Relative),
+                new { password = "wrong-" + i }, Ct);
+            return response.StatusCode;
+        }));
+
+        Assert.All(statuses, s => Assert.True(s is HttpStatusCode.Unauthorized or (HttpStatusCode)429, s.ToString()));
+        var lockout = await app.Services.GetRequiredService<IShopStore>().GetLockoutAsync(AdminAuth.Account, "203.0.113.7", Ct);
+        Assert.True(lockout.Scope.IsLocked(DateTimeOffset.UtcNow, out _));
+        Assert.False(lockout.ShopWide.IsLocked(DateTimeOffset.UtcNow, out _));
+        Assert.True(lockout.ShopWide.FailedCount <= 5, $"shop-wide count {lockout.ShopWide.FailedCount}");
 
         using var owner = new AdminClient(FromPeer(app, TraefikPod, "198.51.100.9"));
         using var signedIn = await owner.LoginAsync(ShopApp.AdminPassword);

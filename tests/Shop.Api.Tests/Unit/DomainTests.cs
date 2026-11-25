@@ -189,6 +189,24 @@ public sealed class DomainTests
         Assert.Equal(TimeSpan.FromMinutes(12), c);
     }
 
+    /// <summary>Attempts while either scope is locked count nowhere, so one address can't reach the ceiling.</summary>
+    [Fact]
+    public void FailuresWhileLockedCountNowhere()
+    {
+        var t0 = DateTimeOffset.UnixEpoch.AddDays(1);
+        var state = LockoutState.Empty;
+        for (var i = 0; i < 100; i++)
+        {
+            state = state.ApplyFailure(LockoutRules.Default, t0);
+        }
+
+        Assert.True(state.Scope.IsLocked(t0, out _));
+        Assert.Equal(new LockoutScope(5, t0, null), state.ShopWide);
+
+        var shopLocked = new LockoutState(new LockoutScope(1, t0, null), new LockoutScope(0, null, t0.AddMinutes(5)));
+        Assert.Equal(shopLocked, shopLocked.ApplyFailure(LockoutRules.Default, t0));
+    }
+
     [Theory]
     [InlineData("*", "10.0.0.1")]
     [InlineData("admin", "*")]

@@ -79,9 +79,15 @@ public sealed record LockoutState(LockoutScope Scope, LockoutScope ShopWide)
         return retryAfter > TimeSpan.Zero;
     }
 
-    public LockoutState ApplyFailure(LockoutRules rules, DateTimeOffset now) => new(
-        rules.PerAccountAddress.ApplyFailure(Scope, now),
-        rules.ShopWide.ApplyFailure(ShopWide, now));
+    /// <summary>
+    /// Counts one failure in both scopes, unless either is already locked: then nothing changes.
+    /// Attempts that slipped past the lock check (concurrent requests) must not count towards the
+    /// ceiling, or one address alone could lock the whole shop. The Redis store mirrors this in
+    /// <c>failed_signin.lua</c>.
+    /// </summary>
+    public LockoutState ApplyFailure(LockoutRules rules, DateTimeOffset now) => IsLocked(now, out _)
+        ? this
+        : new(rules.PerAccountAddress.ApplyFailure(Scope, now), rules.ShopWide.ApplyFailure(ShopWide, now));
 }
 
 public static class LockoutKeys

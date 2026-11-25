@@ -187,9 +187,9 @@ public abstract class ShopStoreContract : IAsyncLifetime
         Assert.Equal(5, locked.ShopWide.FailedCount);
         Assert.Equal(locked, await NewStore().GetLockoutAsync(Admin, AddrA, Ct));
 
-        // Failures while locked don't change the locked scope.
+        // Failures while locked change nothing, not even the shop-wide count.
         var after = await Store.RecordFailedSignInAsync(rules, Admin, AddrA, T0.AddMinutes(6), Ct);
-        Assert.Equal(locked.Scope, after.Scope);
+        Assert.Equal(locked, after);
     }
 
     [Fact]
@@ -237,6 +237,38 @@ public abstract class ShopStoreContract : IAsyncLifetime
         Assert.Equal(new LockoutScope(0, null, T0.AddSeconds(49).AddMinutes(15)), fresh.ShopWide);
         Assert.True(fresh.IsLocked(T0.AddMinutes(10), out _));
         Assert.False(fresh.IsLocked(T0.AddSeconds(49).AddMinutes(15), out _));
+    }
+
+    /// <summary>
+    /// FR-023: one address alone can't trigger the shop-wide lock. Attempts that passed the lock
+    /// check concurrently (here: 60 at once from three replicas) count only until the pair locks.
+    /// </summary>
+    [Fact]
+    public async Task OneAddressAloneCannotLockTheShop()
+    {
+        var replicas = Enumerable.Range(0, 3).Select(_ => NewStore()).ToList();
+
+        await Task.WhenAll(Enumerable.Range(0, 60).Select(i =>
+            Task.Run(() => replicas[i % 3].RecordFailedSignInAsync(LockoutRules.Default, Admin, AddrA, T0, Ct), Ct)));
+
+        var state = await Store.GetLockoutAsync(Admin, AddrA, Ct);
+        Assert.True(state.Scope.IsLocked(T0, out _));
+        Assert.Equal(new LockoutScope(5, T0, null), state.ShopWide);
+        Assert.False((await Store.GetLockoutAsync(Admin, AddrB, Ct)).IsLocked(T0, out _));
+    }
+
+    /// <summary>While the shop-wide scope is locked, failures don't count for any address either.</summary>
+    [Fact]
+    public async Task FailuresDuringTheShopWideLockCountNowhere()
+    {
+        var rules = Rules(perAddress: 5, shopWide: 2);
+        await Store.RecordFailedSignInAsync(rules, Admin, AddrA, T0, Ct);
+        await Store.RecordFailedSignInAsync(rules, Admin, AddrB, T0, Ct);
+
+        var state = await Store.RecordFailedSignInAsync(rules, Admin, AddrB, T0.AddMinutes(1), Ct);
+
+        Assert.True(state.ShopWide.IsLocked(T0.AddMinutes(1), out _));
+        Assert.Equal(new LockoutScope(1, T0, null), state.Scope);
     }
 
     [Fact]
