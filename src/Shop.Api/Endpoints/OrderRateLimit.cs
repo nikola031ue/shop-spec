@@ -11,8 +11,8 @@ namespace Shop.Api.Endpoints;
 /// </summary>
 /// <remarks>
 /// The window is per replica (in memory), so with N replicas a client gets up to N × the limit.
-/// The key is the TCP peer address: forwarded headers are not trusted, because nothing in front
-/// of the shop sets them reliably.
+/// The key is the client address after <see cref="TrustedForwardedHeaders"/>: the forwarded
+/// address from Traefik, otherwise the TCP peer (spec 004 FR-024).
 /// </remarks>
 public static class OrderRateLimit
 {
@@ -35,7 +35,7 @@ public static class OrderRateLimit
             }
 
             o.AddPolicy(Policy, context => RateLimitPartition.GetFixedWindowLimiter(
-                context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+                ClientAddress.Of(context),
                 _ => new FixedWindowRateLimiterOptions
                 {
                     PermitLimit = permits,

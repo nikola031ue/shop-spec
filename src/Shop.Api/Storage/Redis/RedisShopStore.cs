@@ -21,6 +21,7 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
     private static readonly RedisKey ItemNames = "shop:item-names";
     private static readonly RedisKey Orders = "shop:orders";
     private static readonly RedisKey Admin = "shop:admin";
+    private static readonly RedisKey ShopWideLock = "shop:admin:lock:" + LockoutKeys.ShopWide;
     private static readonly RedisKey DpKeys = "shop:dpkeys";
     private static readonly TimeSpan InitLockTtl = TimeSpan.FromSeconds(30);
 
@@ -72,9 +73,6 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
                     new("passwordHash", next.PasswordHash),
                     new("initial", next.Initial ? "1" : "0"),
                     new("changedAt", Ms(next.ChangedAt)),
-                    new("failedCount", next.FailedCount),
-                    new("failedWindowStart", Ms(next.FailedWindowStart)),
-                    new("lockedUntil", Ms(next.LockedUntil)),
                     new("sessionVersion", next.SessionVersion),
                 ]);
             }
@@ -195,27 +193,53 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
             hash,
             fields.GetValueOrDefault("initial") == "1",
             Time(fields.GetValueOrDefault("changedAt")),
-            int.TryParse(fields.GetValueOrDefault("failedCount"), CultureInfo.InvariantCulture, out var n) ? n : 0,
-            Time(fields.GetValueOrDefault("failedWindowStart")),
-            Time(fields.GetValueOrDefault("lockedUntil")),
             long.TryParse(fields.GetValueOrDefault("sessionVersion"), CultureInfo.InvariantCulture, out var v) ? v : 1);
     }
 
-    public async Task<AdminRecord> RecordFailedSignInAsync(LockoutPolicy policy, DateTimeOffset now, CancellationToken ct)
+    public async Task<LockoutState> GetLockoutAsync(string account, string address, CancellationToken ct)
     {
-        await (await DbAsync()).ScriptEvaluateAsync(FailedSignInLua, [Admin],
-        [
-            now.ToUnixTimeMilliseconds(),
-            (long)policy.Window.TotalMilliseconds,
-            policy.MaxFailures,
-            (long)policy.LockFor.TotalMilliseconds,
-        ]);
-        return await GetAdminAsync(ct) ?? throw new InvalidOperationException("The admin record is missing.");
+        LockoutKeys.Validate(account, address);
+        var db = await DbAsync();
+        var scope = db.HashGetAllAsync(LockKey(account, address));
+        var shopWide = db.HashGetAllAsync(ShopWideLock);
+        return new LockoutState(ToScope(await scope), ToScope(await shopWide));
     }
 
-    public async Task ResetFailedSignInsAsync(CancellationToken ct) =>
-        await (await DbAsync()).HashSetAsync(Admin,
-            [new("failedCount", 0), new("failedWindowStart", ""), new("lockedUntil", "")]);
+    public async Task<LockoutState> RecordFailedSignInAsync(
+        LockoutRules rules, string account, string address, DateTimeOffset now, CancellationToken ct)
+    {
+        LockoutKeys.Validate(account, address);
+        await (await DbAsync()).ScriptEvaluateAsync(FailedSignInLua, [LockKey(account, address), ShopWideLock],
+        [
+            now.ToUnixTimeMilliseconds(),
+            .. PolicyArgs(rules.PerAccountAddress),
+            .. PolicyArgs(rules.ShopWide),
+        ]);
+        return await GetLockoutAsync(account, address, ct);
+    }
+
+    public async Task ResetFailedSignInsAsync(string account, string address, CancellationToken ct)
+    {
+        LockoutKeys.Validate(account, address);
+        await (await DbAsync()).KeyDeleteAsync(LockKey(account, address));
+    }
+
+    private static RedisKey LockKey(string account, string address) => $"shop:admin:lock:{account}:{address}";
+
+    private static RedisValue[] PolicyArgs(LockoutPolicy p) =>
+    [
+        (long)p.Window.TotalMilliseconds, p.MaxFailures, (long)p.LockFor.TotalMilliseconds,
+        (long)p.Retention.TotalMilliseconds,
+    ];
+
+    private static LockoutScope ToScope(HashEntry[] entries)
+    {
+        var fields = entries.ToDictionary(e => (string)e.Name!, e => (string?)e.Value);
+        return new LockoutScope(
+            int.TryParse(fields.GetValueOrDefault("failedCount"), CultureInfo.InvariantCulture, out var n) ? n : 0,
+            Time(fields.GetValueOrDefault("failedWindowStart")),
+            Time(fields.GetValueOrDefault("lockedUntil")));
+    }
 
     public async Task<long> SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct) =>
         (long)await (await DbAsync()).ScriptEvaluateAsync(BumpSessionLua, [Admin], [passwordHash, Ms(changedAt)]);

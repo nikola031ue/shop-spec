@@ -19,6 +19,12 @@ public sealed class Settings
     /// <summary>StackExchange.Redis options, set when the shop runs on Redis.</summary>
     public ConfigurationOptions? Redis { get; init; }
 
+    /// <summary>
+    /// Optional <c>TRUSTED_PROXY_HOST</c>: DNS name whose addresses are the only trusted proxies
+    /// (spec 004 FR-022). Null means forwarded headers are ignored.
+    /// </summary>
+    public string? TrustedProxyHost { get; init; }
+
     public static Settings Load(IConfiguration configuration) => Load(key => configuration[key]);
 
     public static Settings Load(Func<string, string?> get)
@@ -68,6 +74,16 @@ public sealed class Settings
             }
         }
 
+        var proxyHost = get("TRUSTED_PROXY_HOST")?.Trim();
+        if (string.IsNullOrEmpty(proxyHost))
+        {
+            proxyHost = null;
+        }
+        else if (Uri.CheckHostName(proxyHost) == UriHostNameType.Unknown)
+        {
+            problems.Add("TRUSTED_PROXY_HOST is not a DNS name or address");
+        }
+
         if (problems.Count > 0)
         {
             throw new SettingsException("Invalid configuration: " + string.Join("; ", problems) + ".");
@@ -80,6 +96,7 @@ public sealed class Settings
             AdminPassword = adminPassword,
             PostgresConnectionString = postgres,
             Redis = redis,
+            TrustedProxyHost = proxyHost,
         };
     }
 

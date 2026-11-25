@@ -123,42 +123,79 @@ public sealed class DomainTests
     [Fact]
     public void LockoutLocksOnFifthFailureWithinWindow()
     {
-        var policy = LockoutPolicy.Default;
+        var policy = LockoutPolicy.PerAccountAddress;
         var t0 = DateTimeOffset.UnixEpoch.AddDays(1);
-        var admin = new AdminRecord("h", true, null, 0, null, null);
+        var scope = LockoutScope.Empty;
 
         for (var i = 1; i <= 4; i++)
         {
-            admin = policy.ApplyFailure(admin, t0.AddMinutes(i));
-            Assert.Equal(i, admin.FailedCount);
-            Assert.False(policy.IsLocked(admin, t0.AddMinutes(i), out _));
+            scope = policy.ApplyFailure(scope, t0.AddMinutes(i));
+            Assert.Equal(i, scope.FailedCount);
+            Assert.False(scope.IsLocked(t0.AddMinutes(i), out _));
         }
 
-        admin = policy.ApplyFailure(admin, t0.AddMinutes(5));
+        scope = policy.ApplyFailure(scope, t0.AddMinutes(5));
 
-        Assert.True(policy.IsLocked(admin, t0.AddMinutes(5), out var retry));
+        Assert.True(scope.IsLocked(t0.AddMinutes(5), out var retry));
         Assert.Equal(TimeSpan.FromMinutes(15), retry);
-        Assert.Equal(0, admin.FailedCount);
-        Assert.Null(admin.FailedWindowStart);
-        Assert.False(policy.IsLocked(admin, t0.AddMinutes(20), out _));
+        Assert.Equal(0, scope.FailedCount);
+        Assert.Null(scope.FailedWindowStart);
+        Assert.False(scope.IsLocked(t0.AddMinutes(20), out _));
     }
 
     [Fact]
     public void LockoutWindowStartsAtFirstFailure()
     {
-        var policy = LockoutPolicy.Default;
+        var policy = LockoutPolicy.PerAccountAddress;
         var t0 = DateTimeOffset.UnixEpoch.AddDays(1);
-        var admin = new AdminRecord("h", true, null, 0, null, null);
+        var scope = LockoutScope.Empty;
 
-        admin = policy.ApplyFailure(admin, t0);
-        admin = policy.ApplyFailure(admin, t0.AddMinutes(14));
-        Assert.Equal(2, admin.FailedCount);
+        scope = policy.ApplyFailure(scope, t0);
+        scope = policy.ApplyFailure(scope, t0.AddMinutes(14));
+        Assert.Equal(2, scope.FailedCount);
 
-        admin = policy.ApplyFailure(admin, t0.AddMinutes(15));
+        scope = policy.ApplyFailure(scope, t0.AddMinutes(15));
 
-        Assert.Equal(1, admin.FailedCount);
-        Assert.Equal(t0.AddMinutes(15), admin.FailedWindowStart);
+        Assert.Equal(1, scope.FailedCount);
+        Assert.Equal(t0.AddMinutes(15), scope.FailedWindowStart);
     }
+
+    /// <summary>Spec 004 FR-023: 5 per (account, address), a ceiling of 50 shop-wide.</summary>
+    [Fact]
+    public void LockoutRulesMatchTheSpec()
+    {
+        Assert.Equal(5, LockoutRules.Default.PerAccountAddress.MaxFailures);
+        Assert.Equal(50, LockoutRules.Default.ShopWide.MaxFailures);
+        Assert.All([LockoutRules.Default.PerAccountAddress, LockoutRules.Default.ShopWide], p =>
+        {
+            Assert.Equal(TimeSpan.FromMinutes(15), p.Window);
+            Assert.Equal(TimeSpan.FromMinutes(15), p.LockFor);
+        });
+    }
+
+    [Fact]
+    public void LockoutStateIsLockedWhileEitherScopeIs()
+    {
+        var t0 = DateTimeOffset.UnixEpoch.AddDays(1);
+        var locked = new LockoutScope(0, null, t0.AddMinutes(10));
+        var longer = new LockoutScope(0, null, t0.AddMinutes(12));
+
+        Assert.False(LockoutState.Empty.IsLocked(t0, out _));
+        Assert.True(new LockoutState(locked, LockoutScope.Empty).IsLocked(t0, out var a));
+        Assert.Equal(TimeSpan.FromMinutes(10), a);
+        Assert.True(new LockoutState(LockoutScope.Empty, locked).IsLocked(t0, out var b));
+        Assert.Equal(TimeSpan.FromMinutes(10), b);
+        Assert.True(new LockoutState(locked, longer).IsLocked(t0, out var c));
+        Assert.Equal(TimeSpan.FromMinutes(12), c);
+    }
+
+    [Theory]
+    [InlineData("*", "10.0.0.1")]
+    [InlineData("admin", "*")]
+    [InlineData("", "10.0.0.1")]
+    [InlineData("admin", "")]
+    public void LockoutKeysCannotHitTheShopWideScope(string account, string address) =>
+        Assert.Throws<ArgumentException>(() => LockoutKeys.Validate(account, address));
 
     [Theory]
     [InlineData("50%", @"50\%")]

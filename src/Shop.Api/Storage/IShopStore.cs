@@ -46,10 +46,18 @@ public interface IShopStore
 
     Task<AdminRecord?> GetAdminAsync(CancellationToken ct);
 
-    /// <summary>Atomically applies <see cref="LockoutPolicy.ApplyFailure"/> and returns the new record.</summary>
-    Task<AdminRecord> RecordFailedSignInAsync(LockoutPolicy policy, DateTimeOffset now, CancellationToken ct);
+    /// <summary>The (account, address) scope and the shop-wide scope; empty when unused or expired.</summary>
+    Task<LockoutState> GetLockoutAsync(string account, string address, CancellationToken ct);
 
-    Task ResetFailedSignInsAsync(CancellationToken ct);
+    /// <summary>
+    /// Atomically applies <see cref="LockoutState.ApplyFailure"/> to the (account, address) scope and
+    /// the shop-wide scope, and returns the new state (spec 004 FR-023).
+    /// </summary>
+    Task<LockoutState> RecordFailedSignInAsync(
+        LockoutRules rules, string account, string address, DateTimeOffset now, CancellationToken ct);
+
+    /// <summary>Clears only the (account, address) scope; the shop-wide scope is kept.</summary>
+    Task ResetFailedSignInsAsync(string account, string address, CancellationToken ct);
 
     /// <summary>
     /// Stores a new hash, sets <c>changedAt</c> and <c>initial=false</c>, and atomically increments

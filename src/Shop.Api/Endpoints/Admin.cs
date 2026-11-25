@@ -67,7 +67,7 @@ public static class AdminEndpoints
     private static async Task<IResult> LoginAsync(
         LoginRequest request, AdminAuth auth, HttpContext context, CancellationToken ct)
     {
-        var result = await auth.SignInAsync(request.Password, ct);
+        var result = await auth.SignInAsync(request.Password, ClientAddress.Of(context), ct);
         switch (result.Status)
         {
             case SignInStatus.Locked:

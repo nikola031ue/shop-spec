@@ -9,6 +9,8 @@ namespace Shop.Api.Tests.Unit;
 public sealed class AdminAuthTests
 {
     private const string Generated = "generated-admin-password";
+    private const string AddressA = "203.0.113.7";
+    private const string AddressB = "198.51.100.9";
     private readonly PasswordHasher<AdminUser> _hasher = new();
     private readonly FakeTimeProvider _time = new(new DateTimeOffset(2026, 11, 24, 10, 0, 0, TimeSpan.Zero));
     private readonly AdminOnlyStore _store = new();
@@ -42,13 +44,12 @@ public sealed class AdminAuthTests
     [Fact]
     public void BootstrapRehashesWhenGeneratedSecretChanged()
     {
-        var admin = AdminAuth.Bootstrap(null, Generated, _hasher)! with { FailedCount = 2 };
+        var admin = AdminAuth.Bootstrap(null, Generated, _hasher)!;
 
         var next = AdminAuth.Bootstrap(admin, "regenerated-password", _hasher);
 
         Assert.NotNull(next);
         Assert.True(next.Initial);
-        Assert.Equal(2, next.FailedCount);
         Assert.Equal(admin.SessionVersion + 1, next.SessionVersion);
         Assert.Equal(PasswordVerificationResult.Success, _hasher.VerifyHashedPassword(AdminUser.Instance, next.PasswordHash, "regenerated-password"));
     }
@@ -57,7 +58,7 @@ public sealed class AdminAuthTests
     public void BootstrapNeverTouchesChangedPassword()
     {
         var changed = new AdminRecord(_hasher.HashPassword(AdminUser.Instance, "my-own-password!"), false,
-            DateTimeOffset.UnixEpoch, 0, null, null);
+            DateTimeOffset.UnixEpoch);
 
         Assert.Null(AdminAuth.Bootstrap(changed, Generated, _hasher));
     }
@@ -67,7 +68,7 @@ public sealed class AdminAuthTests
     {
         var auth = CreateAuth();
 
-        var result = await auth.SignInAsync(Generated, TestContext.Current.CancellationToken);
+        var result = await auth.SignInAsync(Generated, AddressA, TestContext.Current.CancellationToken);
 
         Assert.Equal(SignInStatus.Success, result.Status);
     }
@@ -80,20 +81,56 @@ public sealed class AdminAuthTests
 
         for (var i = 0; i < 5; i++)
         {
-            Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync("wrong", ct)).Status);
+            Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync("wrong", AddressA, ct)).Status);
             _time.Advance(TimeSpan.FromSeconds(30));
         }
 
-        var locked = await auth.SignInAsync(Generated, ct);
+        var locked = await auth.SignInAsync(Generated, AddressA, ct);
         Assert.Equal(SignInStatus.Locked, locked.Status);
         Assert.Equal(TimeSpan.FromMinutes(15) - TimeSpan.FromSeconds(30), locked.RetryAfter);
 
         _time.Advance(TimeSpan.FromMinutes(14));
-        Assert.Equal(SignInStatus.Locked, (await auth.SignInAsync(Generated, ct)).Status);
+        Assert.Equal(SignInStatus.Locked, (await auth.SignInAsync(Generated, AddressA, ct)).Status);
 
         _time.Advance(TimeSpan.FromSeconds(31));
-        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync(Generated, ct)).Status);
-        Assert.Null(_store.Admin!.LockedUntil);
+        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync(Generated, AddressA, ct)).Status);
+        Assert.Equal(LockoutScope.Empty, _store.Scope(AdminAuth.Account, AddressA));
+    }
+
+    /// <summary>FR-023: a lock applies to (account, address); the same account from another address signs in.</summary>
+    [Fact]
+    public async Task LockOnOneAddressDoesNotLockAnother()
+    {
+        var auth = CreateAuth();
+        var ct = TestContext.Current.CancellationToken;
+        for (var i = 0; i < 5; i++)
+        {
+            await auth.SignInAsync("wrong", AddressA, ct);
+        }
+
+        Assert.Equal(SignInStatus.Locked, (await auth.SignInAsync(Generated, AddressA, ct)).Status);
+        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync(Generated, AddressB, ct)).Status);
+        Assert.Equal(SignInStatus.Locked, (await auth.SignInAsync(Generated, AddressA, ct)).Status);
+    }
+
+    /// <summary>FR-023 ceiling: 50 failures across addresses in 15 minutes lock every address.</summary>
+    [Fact]
+    public async Task FiftyFailuresAcrossAddressesLockTheWholeShop()
+    {
+        var auth = CreateAuth();
+        var ct = TestContext.Current.CancellationToken;
+        for (var i = 0; i < 50; i++)
+        {
+            // Two failures per address, so no single address reaches its own limit.
+            Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync("wrong", $"192.0.2.{i / 2}", ct)).Status);
+        }
+
+        var locked = await auth.SignInAsync(Generated, AddressB, ct);
+        Assert.Equal(SignInStatus.Locked, locked.Status);
+        Assert.Equal(TimeSpan.FromMinutes(15), locked.RetryAfter);
+
+        _time.Advance(TimeSpan.FromMinutes(15));
+        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync(Generated, AddressB, ct)).Status);
     }
 
     [Fact]
@@ -104,11 +141,11 @@ public sealed class AdminAuthTests
 
         for (var i = 0; i < 10; i++)
         {
-            Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync("wrong", ct)).Status);
+            Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync("wrong", AddressA, ct)).Status);
             _time.Advance(TimeSpan.FromMinutes(4));
         }
 
-        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync(Generated, ct)).Status);
+        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync(Generated, AddressA, ct)).Status);
     }
 
     [Fact]
@@ -118,14 +155,19 @@ public sealed class AdminAuthTests
         var ct = TestContext.Current.CancellationToken;
         for (var i = 0; i < 4; i++)
         {
-            await auth.SignInAsync("wrong", ct);
+            await auth.SignInAsync("wrong", AddressA, ct);
         }
 
-        await auth.SignInAsync(Generated, ct);
+        await auth.SignInAsync("wrong", AddressB, ct);
 
-        Assert.Equal(0, _store.Admin!.FailedCount);
-        Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync("wrong", ct)).Status);
-        Assert.Equal(1, _store.Admin!.FailedCount);
+        await auth.SignInAsync(Generated, AddressA, ct);
+
+        // Only this address's scope is cleared; the other address and the ceiling keep counting.
+        Assert.Equal(LockoutScope.Empty, _store.Scope(AdminAuth.Account, AddressA));
+        Assert.Equal(1, _store.Scope(AdminAuth.Account, AddressB).FailedCount);
+        Assert.Equal(5, _store.Scope(LockoutKeys.ShopWide, LockoutKeys.ShopWide).FailedCount);
+        Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync("wrong", AddressA, ct)).Status);
+        Assert.Equal(1, _store.Scope(AdminAuth.Account, AddressA).FailedCount);
     }
 
     [Fact]
@@ -143,8 +185,8 @@ public sealed class AdminAuthTests
         Assert.False(_store.Admin!.Initial);
         Assert.Equal(_time.GetUtcNow(), _store.Admin.ChangedAt);
         Assert.False(await auth.IsInitialPasswordAsync(ct));
-        Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync(Generated, ct)).Status);
-        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync("long-enough-pass", ct)).Status);
+        Assert.Equal(SignInStatus.WrongPassword, (await auth.SignInAsync(Generated, AddressA, ct)).Status);
+        Assert.Equal(SignInStatus.Success, (await auth.SignInAsync("long-enough-pass", AddressA, ct)).Status);
     }
 
     [Fact]
@@ -163,22 +205,33 @@ public sealed class AdminAuthTests
         Assert.Equal(TimeSpan.FromSeconds(10), delays[^1]);
     }
 
-    /// <summary>In-memory admin record; only the admin members are used by <see cref="AdminAuth"/>.</summary>
+    /// <summary>In-memory admin record and lockout scopes; only these members are used by <see cref="AdminAuth"/>.</summary>
     private sealed class AdminOnlyStore : IShopStore
     {
+        private readonly Dictionary<(string, string), LockoutScope> _scopes = [];
+
         public AdminRecord? Admin { get; set; }
+
+        public LockoutScope Scope(string account, string address) =>
+            _scopes.GetValueOrDefault((account, address), LockoutScope.Empty);
 
         public Task<AdminRecord?> GetAdminAsync(CancellationToken ct) => Task.FromResult(Admin);
 
-        public Task<AdminRecord> RecordFailedSignInAsync(LockoutPolicy policy, DateTimeOffset now, CancellationToken ct)
+        public Task<LockoutState> GetLockoutAsync(string account, string address, CancellationToken ct) =>
+            Task.FromResult(new LockoutState(Scope(account, address), Scope(LockoutKeys.ShopWide, LockoutKeys.ShopWide)));
+
+        public async Task<LockoutState> RecordFailedSignInAsync(
+            LockoutRules rules, string account, string address, DateTimeOffset now, CancellationToken ct)
         {
-            Admin = policy.ApplyFailure(Admin!, now);
-            return Task.FromResult(Admin);
+            var next = (await GetLockoutAsync(account, address, ct)).ApplyFailure(rules, now);
+            _scopes[(account, address)] = next.Scope;
+            _scopes[(LockoutKeys.ShopWide, LockoutKeys.ShopWide)] = next.ShopWide;
+            return next;
         }
 
-        public Task ResetFailedSignInsAsync(CancellationToken ct)
+        public Task ResetFailedSignInsAsync(string account, string address, CancellationToken ct)
         {
-            Admin = Admin! with { FailedCount = 0, FailedWindowStart = null, LockedUntil = null };
+            _scopes.Remove((account, address));
             return Task.CompletedTask;
         }
 

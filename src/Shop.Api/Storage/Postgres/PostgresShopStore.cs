@@ -16,8 +16,8 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
 
     private const string ItemColumns = "id, name, stock, price_cents, created_at, updated_at";
     private const string OrderColumns = "reference, created_at, status, wallet_address, total_cents, lines";
-    private const string AdminColumns =
-        "password_hash, initial, changed_at, failed_count, failed_window_start, locked_until, session_version";
+    private const string AdminColumns = "password_hash, initial, changed_at, session_version";
+    private const string LockoutColumns = "account, address, failed_count, failed_window_start, locked_until";
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -59,9 +59,8 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             {
                 await ExecuteAsync(conn, $"""
                     INSERT INTO admin (id, {AdminColumns})
-                    VALUES (1, @hash, @initial, @changed, @count, @start, @locked, @version)
+                    VALUES (1, @hash, @initial, @changed, @version)
                     ON CONFLICT (id) DO UPDATE SET password_hash = @hash, initial = @initial, changed_at = @changed,
-                        failed_count = @count, failed_window_start = @start, locked_until = @locked,
                         session_version = @version
                     """, ct, AdminParameters(next));
             }
@@ -257,26 +256,82 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
         return await ReadAdminAsync(conn, forUpdate: false, ct);
     }
 
-    public async Task<AdminRecord> RecordFailedSignInAsync(LockoutPolicy policy, DateTimeOffset now, CancellationToken ct)
+    public async Task<LockoutState> GetLockoutAsync(string account, string address, CancellationToken ct)
     {
+        LockoutKeys.Validate(account, address);
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        return await ReadLockoutAsync(conn, account, address, forUpdate: false, ct);
+    }
+
+    public async Task<LockoutState> RecordFailedSignInAsync(
+        LockoutRules rules, string account, string address, DateTimeOffset now, CancellationToken ct)
+    {
+        LockoutKeys.Validate(account, address);
+        now = StoreTime.Truncate(now);
         await using var conn = await _dataSource.OpenConnectionAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
-        var admin = await ReadAdminAsync(conn, forUpdate: true, ct)
-            ?? throw new InvalidOperationException("The admin record is missing.");
-        var next = policy.ApplyFailure(admin, StoreTime.Truncate(now));
+
+        // Both rows exist before they are locked; the shop-wide row first, in the same order as the
+        // FOR UPDATE below, so concurrent failures never deadlock.
         await ExecuteAsync(conn, """
-            UPDATE admin SET failed_count = @count, failed_window_start = @start, locked_until = @locked WHERE id = 1
-            """, ct, AdminParameters(next));
+            INSERT INTO admin_lockouts (account, address) VALUES ('*', '*'), (@account, @address)
+            ON CONFLICT (account, address) DO NOTHING
+            """, ct, ("account", account), ("address", address));
+        var current = await ReadLockoutAsync(conn, account, address, forUpdate: true, ct);
+        var next = current.ApplyFailure(rules, now);
+        await WriteScopeAsync(conn, account, address, next.Scope, ct);
+        await WriteScopeAsync(conn, LockoutKeys.ShopWide, LockoutKeys.ShopWide, next.ShopWide, ct);
+
+        // Rows whose window and lock are both over no longer matter.
+        var retention = rules.PerAccountAddress.Retention > rules.ShopWide.Retention
+            ? rules.PerAccountAddress.Retention
+            : rules.ShopWide.Retention;
+        await ExecuteAsync(conn, """
+            DELETE FROM admin_lockouts
+            WHERE coalesce(locked_until, '-infinity') <= @now
+              AND coalesce(failed_window_start, '-infinity') <= @stale
+              AND NOT (account = @account AND address = @address) AND account <> '*'
+            """, ct, ("now", Time(now)), ("stale", Time(now - retention)), ("account", account), ("address", address));
         await tx.CommitAsync(ct);
         return next;
     }
 
-    public async Task ResetFailedSignInsAsync(CancellationToken ct)
+    public async Task ResetFailedSignInsAsync(string account, string address, CancellationToken ct)
     {
+        LockoutKeys.Validate(account, address);
         await using var conn = await _dataSource.OpenConnectionAsync(ct);
-        await ExecuteAsync(conn,
-            "UPDATE admin SET failed_count = 0, failed_window_start = NULL, locked_until = NULL WHERE id = 1", ct);
+        await ExecuteAsync(conn, "DELETE FROM admin_lockouts WHERE account = @account AND address = @address", ct,
+            ("account", account), ("address", address));
     }
+
+    private static async Task<LockoutState> ReadLockoutAsync(
+        NpgsqlConnection conn, string account, string address, bool forUpdate, CancellationToken ct)
+    {
+        await using var cmd = Command(conn, $"""
+            SELECT {LockoutColumns} FROM admin_lockouts
+            WHERE (account = @account AND address = @address) OR (account = '*' AND address = '*')
+            ORDER BY account COLLATE "C", address COLLATE "C"
+            """ + (forUpdate ? " FOR UPDATE" : ""), ("account", account), ("address", address));
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        var state = LockoutState.Empty;
+        while (await reader.ReadAsync(ct))
+        {
+            var scope = new LockoutScope(reader.GetInt32(2), NullableTime(reader, 3), NullableTime(reader, 4));
+            state = reader.GetString(0) == LockoutKeys.ShopWide && reader.GetString(1) == LockoutKeys.ShopWide
+                ? state with { ShopWide = scope }
+                : state with { Scope = scope };
+        }
+
+        return state;
+    }
+
+    private static Task<int> WriteScopeAsync(
+        NpgsqlConnection conn, string account, string address, LockoutScope scope, CancellationToken ct) =>
+        ExecuteAsync(conn, """
+            UPDATE admin_lockouts SET failed_count = @count, failed_window_start = @start, locked_until = @locked
+            WHERE account = @account AND address = @address
+            """, ct, ("count", scope.FailedCount), ("start", Time(scope.FailedWindowStart)),
+            ("locked", Time(scope.LockedUntil)), ("account", account), ("address", address));
 
     public async Task<long> SetAdminPasswordAsync(string passwordHash, DateTimeOffset changedAt, CancellationToken ct)
     {
@@ -349,16 +404,12 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             reader.GetString(0),
             reader.GetBoolean(1),
             NullableTime(reader, 2),
-            reader.GetInt32(3),
-            NullableTime(reader, 4),
-            NullableTime(reader, 5),
-            reader.GetInt64(6));
+            reader.GetInt64(3));
     }
 
     private static (string, object?)[] AdminParameters(AdminRecord a) =>
     [
         ("hash", a.PasswordHash), ("initial", a.Initial), ("changed", Time(a.ChangedAt)),
-        ("count", a.FailedCount), ("start", Time(a.FailedWindowStart)), ("locked", Time(a.LockedUntil)),
         ("version", a.SessionVersion),
     ];
 

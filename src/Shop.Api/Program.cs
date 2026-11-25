@@ -21,10 +21,14 @@ builder.Services.AddHostedService<StoreInitializer>();
 builder.Services.AddProblemDetails();
 builder.Services.AddAdminAuth();
 builder.Services.AddOrderRateLimit();
+builder.Services.AddTrustedProxies();
 
 var app = builder.Build();
 
+// First, so everything after it (rate limits, lockout, cookies) sees the real client (spec 004 FR-022).
+app.UseTrustedForwardedHeaders();
 app.UseSecurityHeaders();
+app.UseCookiePolicy();
 app.UseShopErrorHandling();
 app.UseDefaultFiles();
 app.UseStaticFiles();
