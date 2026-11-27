@@ -138,4 +138,68 @@ public sealed class SettingsTests
         Assert.DoesNotContain(AdminSecret, message, StringComparison.Ordinal);
         Assert.DoesNotContain(RedisSecret, message, StringComparison.Ordinal);
     }
+
+    // ---- Spec 005 settings (all optional, so 0.3.0 runs under an operator that doesn't set them) ----
+
+    [Fact]
+    public void PaymentSettingsDefaultToOffAndSepolia()
+    {
+        var settings = Load(Postgres());
+
+        Assert.False(settings.PaymentsEnabled);
+        Assert.Null(settings.TokenAddress);
+        Assert.Null(settings.InternalToken);
+        Assert.Equal((11155111L, "https://sepolia.etherscan.io/tx/", 30, 8081, 8080),
+            (settings.ChainId, settings.ExplorerTxUrl, settings.OrderPaymentMinutes, settings.InternalPort, settings.PublicPort));
+    }
+
+    [Fact]
+    public void PaymentSettingsAreReadAndTheTokenAddressChecksummed()
+    {
+        var env = Postgres();
+        env["TOKEN_ADDRESS"] = "0xdf8d5deb736ebc79f7e99c4c90975d4b8f8d80e2";
+        env["CHAIN_ID"] = "31337";
+        env["EXPLORER_TX_URL"] = "https://explorer.example/tx/";
+        env["ORDER_PAYMENT_MINUTES"] = "45";
+        env["INTERNAL_TOKEN"] = new string('k', 44);
+        env["INTERNAL_PORT"] = "9091";
+        env["HTTP_PORTS"] = "9090;9095";
+
+        var settings = Load(env);
+
+        Assert.True(settings.PaymentsEnabled);
+        Assert.Equal("0xdF8d5dEb736EBC79f7e99C4c90975d4b8f8d80E2", settings.TokenAddress);
+        Assert.Equal((31337L, "https://explorer.example/tx/", 45, 9091, 9090),
+            (settings.ChainId, settings.ExplorerTxUrl, settings.OrderPaymentMinutes, settings.InternalPort, settings.PublicPort));
+    }
+
+    [Theory]
+    [InlineData("TOKEN_ADDRESS", "0xnot-an-address")]
+    [InlineData("TOKEN_ADDRESS", "0xdF8d5dEb736EBC79f7e99C4c90975d4b8f8d80e2")] // checksum typo
+    [InlineData("CHAIN_ID", "zero")]
+    [InlineData("ORDER_PAYMENT_MINUTES", "-5")]
+    [InlineData("ORDER_PAYMENT_MINUTES", "1441")]
+    [InlineData("EXPLORER_TX_URL", "http://insecure.example/tx/")]
+    [InlineData("INTERNAL_TOKEN", "too-short")]
+    [InlineData("INTERNAL_PORT", "70000")]
+    public void InvalidPaymentSettingsNameTheVariableNotTheValue(string name, string value)
+    {
+        var env = Postgres();
+        env[name] = value;
+
+        var error = Assert.Throws<SettingsException>(() => Load(env));
+
+        Assert.Contains(name, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(value, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheInternalPortMustDifferFromThePublicPort()
+    {
+        var env = Postgres();
+        env["INTERNAL_TOKEN"] = new string('k', 44);
+        env["INTERNAL_PORT"] = "8080";
+
+        Assert.Contains("INTERNAL_PORT", Assert.Throws<SettingsException>(() => Load(env)).Message, StringComparison.Ordinal);
+    }
 }

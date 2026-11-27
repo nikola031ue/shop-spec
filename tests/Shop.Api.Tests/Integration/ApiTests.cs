@@ -98,7 +98,7 @@ public sealed class StaticResolver(params string[] addresses) : IHostResolver
 /// US1 scenarios 1–6 and the admin security requirements through HTTP, once per store
 /// (contracts/http-api.md "Admin"). Each test gets an empty database.
 /// </summary>
-public abstract class ApiContract
+public abstract partial class ApiContract
 {
     private const string NewPassword = "a-new-admin-password-1";
 
@@ -180,7 +180,7 @@ public abstract class ApiContract
         var store = app.Services.GetRequiredService<IShopStore>();
         var cap = list.Items.Single(i => i.Name == "Red Cap");
         var order = (await store.PlaceOrderAsync(new NewOrder(OrderReference.New(), DateTimeOffset.UtcNow, "0x1",
-            [new OrderRequestLine(cap.Id, 1, 750)]), Ct)).Order!;
+            [new OrderRequestLine(cap.Id, 1, 750)], TestAccounts.New(), DateTimeOffset.UtcNow.AddMinutes(30)), Ct)).Order!;
 
         using var delete = await client.SendAsync(HttpMethod.Delete, $"/api/admin/items/{cap.Id}");
         Assert.Equal(HttpStatusCode.NoContent, delete.StatusCode);
@@ -399,8 +399,10 @@ public abstract class ApiContract
 
     // ---- Public storefront API (US2) ----
 
+    /// <summary>Places an order for a fresh paying account (spec 005 FR-002a, FR-005a).</summary>
     private static async Task<HttpResponseMessage> OrderAsync(HttpClient anonymous, params object[] lines) =>
-        await anonymous.PostAsJsonAsync(new Uri("/api/orders", UriKind.Relative), new { lines }, Ct);
+        await anonymous.PostAsJsonAsync(new Uri("/api/orders", UriKind.Relative),
+            new { lines, payingAccount = TestAccounts.New() }, Ct);
 
     /// <summary>FR-009, FR-010, US2 scenario 1: shop name and case-insensitive search, no sign-in.</summary>
     [Fact]
@@ -816,7 +818,8 @@ public abstract class ApiContract
         for (var i = 0; i < count; i++)
         {
             var placed = await store.PlaceOrderAsync(new NewOrder(OrderReference.New(), t0.AddMinutes(i),
-                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", [new OrderRequestLine(itemId, 1, 100)]), Ct);
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", [new OrderRequestLine(itemId, 1, 100)], TestAccounts.New(),
+                t0.AddMinutes(i + 30)), Ct);
             references.Add(placed.Order!.Reference);
         }
 

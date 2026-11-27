@@ -36,13 +36,44 @@ public interface IShopStore
     Task<bool> DeleteItemAsync(Guid id, CancellationToken ct);
 
     /// <summary>
-    /// Atomically checks every line (exists, price equal, stock enough), then decrements stock and
-    /// stores the order, or changes nothing and returns the problems (research R9).
+    /// Atomically checks every line (exists, price equal, stock enough) and that the paying account
+    /// has no order waiting for payment (spec 005 FR-005a), then decrements stock and stores the
+    /// order, or changes nothing and returns why (research R9).
     /// </summary>
     Task<PlaceOrderResult> PlaceOrderAsync(NewOrder order, CancellationToken ct);
 
     /// <summary>Orders newest first.</summary>
     Task<Page<Order>> ListOrdersAsync(int page, int pageSize, CancellationToken ct);
+
+    /// <summary>One order by its reference (the buyer's handle), or null.</summary>
+    Task<Order?> GetOrderAsync(string reference, CancellationToken ct);
+
+    /// <summary>
+    /// Records one confirmed transfer in one atomic step: it pays the matching order (spec 005
+    /// research R6) or is recorded as not matched with a reason. Idempotent on (tx, log index).
+    /// </summary>
+    Task<TransferOutcome> RecordTransferAsync(ChainTransfer transfer, DateTimeOffset receivedAt, CancellationToken ct);
+
+    /// <summary>Moves the chain progress for an address forward; never backwards.</summary>
+    Task AdvanceChainProgressAsync(ChainProgress progress, CancellationToken ct);
+
+    Task<ChainProgress?> GetChainProgressAsync(string address, CancellationToken ct);
+
+    /// <summary>True when an order was ever placed to this address or progress exists for it.</summary>
+    Task<bool> IsKnownAddressAsync(string address, CancellationToken ct);
+
+    /// <summary>
+    /// Expires up to <paramref name="limit"/> orders that are waiting, past their deadline and whose
+    /// address's chain progress is past the deadline too (research R5), returning their stock in the
+    /// same step, each exactly once. Returns how many were expired.
+    /// </summary>
+    Task<int> ExpireDueOrdersAsync(DateTimeOffset now, int limit, CancellationToken ct);
+
+    /// <summary>Orders to this address still waiting for payment (D-1).</summary>
+    Task<long> CountWaitingAsync(string address, CancellationToken ct);
+
+    /// <summary>Recorded transfers newest first (by block time); only unmatched ones when asked.</summary>
+    Task<Page<Payment>> ListPaymentsAsync(bool unmatchedOnly, int page, int pageSize, CancellationToken ct);
 
     Task<AdminRecord?> GetAdminAsync(CancellationToken ct);
 
@@ -95,12 +126,18 @@ public static class ProblemKind
 /// <summary>Why one requested line can't be ordered (contracts/http-api.md 409).</summary>
 public sealed record OrderProblem(Guid ItemId, string Kind, long? CurrentPriceCents = null, int? CurrentStock = null);
 
-/// <summary>Exactly one of: placed <see cref="Order"/>, <see cref="Problems"/>, or a reference collision.</summary>
-public sealed record PlaceOrderResult(Order? Order, IReadOnlyList<OrderProblem> Problems, bool ReferenceTaken = false)
+/// <summary>
+/// Exactly one of: placed <see cref="Order"/>, <see cref="Problems"/>, a reference collision, or the
+/// paying account's order that is still waiting (<see cref="WaitingOrder"/>, FR-005a).
+/// </summary>
+public sealed record PlaceOrderResult(
+    Order? Order, IReadOnlyList<OrderProblem> Problems, bool ReferenceTaken = false, string? WaitingOrder = null)
 {
     public static PlaceOrderResult Placed(Order order) => new(order, []);
 
     public static PlaceOrderResult Rejected(IReadOnlyList<OrderProblem> problems) => new(null, problems);
+
+    public static PlaceOrderResult Waiting(string reference) => new(null, [], WaitingOrder: reference);
 
     public static readonly PlaceOrderResult Taken = new(null, [], ReferenceTaken: true);
 }

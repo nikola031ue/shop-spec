@@ -25,6 +25,47 @@ public sealed class Settings
     /// </summary>
     public string? TrustedProxyHost { get; init; }
 
+    /// <summary>
+    /// <c>TOKEN_ADDRESS</c>: the mUSDT contract (EIP-55). Null means payments are unavailable and
+    /// checkout is refused (spec 005 contracts/shop-api.md).
+    /// </summary>
+    public string? TokenAddress { get; init; }
+
+    /// <summary><c>CHAIN_ID</c>, default 11155111 (Sepolia).</summary>
+    public long ChainId { get; init; } = DefaultChainId;
+
+    /// <summary><c>EXPLORER_TX_URL</c>: a transaction hash appended gives its explorer page.</summary>
+    public string ExplorerTxUrl { get; init; } = DefaultExplorerTxUrl;
+
+    /// <summary><c>ORDER_PAYMENT_MINUTES</c>: the payment window (FR-009), default 30.</summary>
+    public int OrderPaymentMinutes { get; init; } = DefaultOrderPaymentMinutes;
+
+    /// <summary>
+    /// <c>INTERNAL_TOKEN</c>: bearer token for the operator's internal API. Null means the internal
+    /// port is not opened (spec 005 contracts/shop-internal-api.md).
+    /// </summary>
+    public string? InternalToken { get; init; }
+
+    /// <summary><c>INTERNAL_PORT</c>, default 8081: the internal API's own listener.</summary>
+    public int InternalPort { get; init; } = DefaultInternalPort;
+
+    /// <summary>
+    /// The public port (<c>ASPNETCORE_HTTP_PORTS</c>, default 8080). Only used to listen explicitly
+    /// next to the internal port; otherwise Kestrel's defaults apply.
+    /// </summary>
+    public int PublicPort { get; init; } = DefaultPublicPort;
+
+    public const long DefaultChainId = 11155111;
+    public const string DefaultExplorerTxUrl = "https://sepolia.etherscan.io/tx/";
+    public const int DefaultOrderPaymentMinutes = 30;
+    public const int DefaultInternalPort = 8081;
+    public const int DefaultPublicPort = 8080;
+
+    /// <summary>The shortest internal token accepted; the operator generates 32 random bytes (base64, 44 characters).</summary>
+    public const int MinInternalTokenLength = 32;
+
+    public bool PaymentsEnabled => TokenAddress is not null;
+
     public static Settings Load(IConfiguration configuration) => Load(key => configuration[key]);
 
     public static Settings Load(Func<string, string?> get)
@@ -84,6 +125,38 @@ public sealed class Settings
             problems.Add("TRUSTED_PROXY_HOST is not a DNS name or address");
         }
 
+        string? tokenAddress = null;
+        if (Optional("TOKEN_ADDRESS") is { } token)
+        {
+            tokenAddress = Domain.Eip55.Normalize(token, out _);
+            if (tokenAddress is null)
+            {
+                problems.Add("TOKEN_ADDRESS is not a valid Ethereum address");
+            }
+        }
+
+        var chainId = Number("CHAIN_ID", DefaultChainId, 1, long.MaxValue);
+        var orderMinutes = (int)Number("ORDER_PAYMENT_MINUTES", DefaultOrderPaymentMinutes, 1, 24 * 60);
+        var internalPort = (int)Number("INTERNAL_PORT", DefaultInternalPort, 0, 65535);
+        var publicPort = (int)Number("HTTP_PORTS", DefaultPublicPort, 0, 65535);
+
+        var explorer = Optional("EXPLORER_TX_URL") ?? DefaultExplorerTxUrl;
+        if (!Uri.TryCreate(explorer, UriKind.Absolute, out var explorerUri) || explorerUri.Scheme != Uri.UriSchemeHttps)
+        {
+            problems.Add("EXPLORER_TX_URL is not an https URL");
+        }
+
+        var internalToken = Optional("INTERNAL_TOKEN");
+        if (internalToken is not null && internalToken.Length < MinInternalTokenLength)
+        {
+            problems.Add($"INTERNAL_TOKEN is shorter than {MinInternalTokenLength} characters");
+        }
+
+        if (internalToken is not null && internalPort != 0 && internalPort == publicPort)
+        {
+            problems.Add("INTERNAL_PORT must differ from the public port");
+        }
+
         if (problems.Count > 0)
         {
             throw new SettingsException("Invalid configuration: " + string.Join("; ", problems) + ".");
@@ -97,7 +170,35 @@ public sealed class Settings
             PostgresConnectionString = postgres,
             Redis = redis,
             TrustedProxyHost = proxyHost,
+            TokenAddress = tokenAddress,
+            ChainId = chainId,
+            ExplorerTxUrl = explorer,
+            OrderPaymentMinutes = orderMinutes,
+            InternalToken = internalToken,
+            InternalPort = internalPort,
+            PublicPort = publicPort,
         };
+
+        string? Optional(string name) => get(name) is { } v && !string.IsNullOrWhiteSpace(v) ? v.Trim() : null;
+
+        long Number(string name, long fallback, long min, long max)
+        {
+            if (Optional(name) is not { } text)
+            {
+                return fallback;
+            }
+
+            // ASPNETCORE_HTTP_PORTS may list several ports ("8080;8081"); the first is the public one.
+            text = text.Split(';', ',')[0].Trim();
+            if (!long.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var n)
+                || n < min || n > max)
+            {
+                problems.Add($"{name} must be a whole number from {min} to {max}");
+                return fallback;
+            }
+
+            return n;
+        }
     }
 
     /// <summary>Converts a CNPG <c>uri</c> (<c>postgresql://user:pw@host:5432/db</c>) for Npgsql.</summary>

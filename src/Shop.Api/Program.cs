@@ -2,6 +2,7 @@
 using Shop.Api;
 using Shop.Api.Auth;
 using Shop.Api.Endpoints;
+using Shop.Api.Payments;
 using Shop.Api.Storage;
 using Shop.Api.Storage.Postgres;
 using Shop.Api.Storage.Redis;
@@ -18,12 +19,20 @@ builder.Services.AddSingleton<IShopStore>(sp =>
         : new RedisShopStore(settings.Redis!);
 });
 builder.Services.AddHostedService<StoreInitializer>();
+builder.Services.AddSingleton<ExpiryJob>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ExpiryJob>());
+
+// Spec 005: a second listener for the operator's internal API, only when INTERNAL_TOKEN is set.
+builder.WebHost.ConfigureKestrel(InternalEndpoints.ConfigureListeners);
 builder.Services.AddProblemDetails();
 builder.Services.AddAdminAuth();
 builder.Services.AddOrderRateLimit();
 builder.Services.AddTrustedProxies();
 
 var app = builder.Build();
+
+// The internal listener serves only /internal (spec 005 contracts/shop-internal-api.md).
+app.UseInternalListenerScope();
 
 // First, so everything after it (rate limits, lockout, cookies) sees the real client (spec 004 FR-022).
 app.UseTrustedForwardedHeaders();
@@ -45,6 +54,7 @@ app.MapGet("/healthz", async (IShopStore store, CancellationToken ct) =>
 
 app.MapPublicEndpoints();
 app.MapAdminEndpoints();
+app.MapInternalEndpoints();
 
 // Unknown API paths are 404s; every other path is a client route of the Angular app.
 app.MapFallback("/api/{**path}", () => Results.Problem(statusCode: StatusCodes.Status404NotFound));

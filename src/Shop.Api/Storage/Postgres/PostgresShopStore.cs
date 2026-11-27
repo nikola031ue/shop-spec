@@ -1,5 +1,6 @@
 using System.Data.Common;
 using System.Globalization;
+using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using Npgsql;
@@ -15,7 +16,16 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
     private const long InitLockKey = 0x5348_4F50_0001;
 
     private const string ItemColumns = "id, name, stock, price_cents, created_at, updated_at";
-    private const string OrderColumns = "reference, created_at, status, wallet_address, total_cents, lines";
+    private const string OrderColumns =
+        "reference, created_at, status, wallet_address, total_cents, lines, paying_account, deadline, " +
+        "paid_tx, paid_log_index, paid_block, paid_at";
+
+    private const string PaymentColumns =
+        "tx_hash, log_index, block, block_time, from_account, to_address, value_base_units, order_reference, " +
+        "unmatched_reason, received_at";
+
+    /// <summary>The partial unique index behind FR-005a (one waiting order per paying account).</summary>
+    private const string OneWaitingIndex = "orders_one_waiting_per_account";
     private const string AdminColumns = "password_hash, initial, changed_at, session_version";
     private const string LockoutColumns = "account, address, failed_count, failed_window_start, locked_until";
 
@@ -159,6 +169,11 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
         var createdAt = StoreTime.Truncate(order.CreatedAt);
         var ids = order.Lines.Select(l => l.ItemId).ToArray();
         await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        if (await WaitingReferenceAsync(conn, order.PayingAccount, ct) is { } waiting)
+        {
+            return PlaceOrderResult.Waiting(waiting);
+        }
+
         await using var tx = await conn.BeginTransactionAsync(ct);
 
         // Lock the rows in id order so concurrent orders never deadlock (research R9).
@@ -209,12 +224,28 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
             """, ct, ("ids", ids), ("qs", order.Lines.Select(l => l.Quantity).ToArray()), ("now", createdAt));
 
         var placed = new Order(order.Reference, createdAt, OrderStatus.PendingPayment, order.WalletAddress,
-            lines.Sum(l => checked(l.UnitPriceCents * l.Quantity)), lines);
-        var inserted = await ExecuteAsync(conn, $"""
-            INSERT INTO orders ({OrderColumns}) VALUES (@ref, @at, @status, @wallet, @total, @lines)
-            ON CONFLICT (reference) DO NOTHING
-            """, ct, ("ref", placed.Reference), ("at", createdAt), ("status", placed.Status),
-            ("wallet", placed.WalletAddress), ("total", placed.TotalCents), ("lines", Jsonb(placed.Lines)));
+            lines.Sum(l => checked(l.UnitPriceCents * l.Quantity)), lines, order.PayingAccount,
+            StoreTime.Truncate(order.Deadline));
+        int inserted;
+        try
+        {
+            inserted = await ExecuteAsync(conn, """
+                INSERT INTO orders (reference, created_at, status, wallet_address, total_cents, lines, paying_account, deadline)
+                VALUES (@ref, @at, @status, @wallet, @total, @lines, @account, @deadline)
+                ON CONFLICT (reference) DO NOTHING
+                """, ct, ("ref", placed.Reference), ("at", createdAt), ("status", placed.Status),
+                ("wallet", placed.WalletAddress), ("total", placed.TotalCents), ("lines", Jsonb(placed.Lines)),
+                ("account", placed.PayingAccount), ("deadline", placed.Deadline));
+        }
+        catch (PostgresException e) when (e.SqlState == PostgresErrorCodes.UniqueViolation && e.ConstraintName == OneWaitingIndex)
+        {
+            // A concurrent checkout with the same account won (FR-005a); nothing of this one stays.
+            await tx.RollbackAsync(ct);
+            return await WaitingReferenceAsync(conn, order.PayingAccount, ct) is { } winner
+                ? PlaceOrderResult.Waiting(winner)
+                : throw new InvalidOperationException("The waiting order vanished during checkout; retry.", e);
+        }
+
         if (inserted == 0)
         {
             await tx.RollbackAsync(ct);
@@ -236,19 +267,230 @@ public sealed class PostgresShopStore(string connectionString) : IShopStore, IAs
         {
             while (await reader.ReadAsync(ct))
             {
-                orders.Add(new Order(
-                    reader.GetString(0),
-                    reader.GetFieldValue<DateTimeOffset>(1),
-                    reader.GetString(2),
-                    reader.GetString(3),
-                    reader.GetInt64(4),
-                    JsonSerializer.Deserialize<List<OrderLine>>(reader.GetString(5), Json)!));
+                orders.Add(ReadOrder(reader));
             }
         }
 
         await using var count = Command(conn, "SELECT count(*) FROM orders");
         return new Page<Order>(orders, page, pageSize, (long)(await count.ExecuteScalarAsync(ct))!);
     }
+
+    public async Task<Order?> GetOrderAsync(string reference, CancellationToken ct)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await using var cmd = Command(conn, $"SELECT {OrderColumns} FROM orders WHERE reference = @ref", ("ref", reference));
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? ReadOrder(reader) : null;
+    }
+
+    public async Task<TransferOutcome> RecordTransferAsync(ChainTransfer transfer, DateTimeOffset receivedAt, CancellationToken ct)
+    {
+        var t = transfer;
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+
+        // Cheap idempotence check first; the primary key below settles any race.
+        await using (var seen = Command(conn, "SELECT 1 FROM payments WHERE tx_hash = @tx AND log_index = @log",
+            ("tx", t.Tx), ("log", t.LogIndex)))
+        {
+            if (await seen.ExecuteScalarAsync(ct) is not null)
+            {
+                await tx.RollbackAsync(ct);
+                return TransferOutcome.AlreadyRecorded;
+            }
+        }
+
+        // The account's waiting order (at most one, FR-005a), locked so a concurrent delivery or the
+        // expiry job sees the result; else its latest order, for the reason.
+        Order? waiting = null, latest = null;
+        await using (var cmd = Command(conn, $"""
+            SELECT {OrderColumns} FROM orders WHERE paying_account = @from AND status = 'PendingPayment' FOR UPDATE
+            """, ("from", t.From)))
+        await using (var reader = await cmd.ExecuteReaderAsync(ct))
+        {
+            if (await reader.ReadAsync(ct))
+            {
+                waiting = ReadOrder(reader);
+            }
+        }
+
+        if (waiting is null)
+        {
+            await using var cmd = Command(conn, $"""
+                SELECT {OrderColumns} FROM orders WHERE paying_account = @from AND wallet_address = @to
+                ORDER BY created_at DESC LIMIT 1
+                """, ("from", t.From), ("to", t.To));
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (await reader.ReadAsync(ct))
+            {
+                latest = ReadOrder(reader);
+            }
+        }
+
+        var (paid, reason) = PaymentMatching.Decide(t, waiting, latest);
+        var inserted = await ExecuteAsync(conn, $"""
+            INSERT INTO payments ({PaymentColumns})
+            VALUES (@tx, @log, @block, @time, @from, @to, @value, @order, @reason, @received)
+            ON CONFLICT (tx_hash, log_index) DO NOTHING
+            """, ct, ("tx", t.Tx), ("log", t.LogIndex), ("block", t.Block), ("time", Time(t.BlockTime)),
+            ("from", t.From), ("to", t.To), ("value", t.Value), ("order", Text(paid?.Reference)),
+            ("reason", Text(reason)), ("received", Time(receivedAt)));
+        if (inserted == 0)
+        {
+            await tx.RollbackAsync(ct);
+            return TransferOutcome.AlreadyRecorded;
+        }
+
+        if (paid is not null)
+        {
+            var updated = await ExecuteAsync(conn, """
+                UPDATE orders SET status = 'Paid', paid_tx = @tx, paid_log_index = @log, paid_block = @block, paid_at = @time
+                WHERE reference = @ref AND status = 'PendingPayment'
+                """, ct, ("tx", t.Tx), ("log", t.LogIndex), ("block", t.Block), ("time", Time(t.BlockTime)),
+                ("ref", paid.Reference));
+            if (updated != 1)
+            {
+                throw new InvalidOperationException($"Order {paid.Reference} changed while locked.");
+            }
+        }
+
+        await tx.CommitAsync(ct);
+        return paid is not null ? TransferOutcome.Paid : TransferOutcome.Unmatched;
+    }
+
+    public async Task AdvanceChainProgressAsync(ChainProgress progress, CancellationToken ct)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await ExecuteAsync(conn, """
+            INSERT INTO chain_progress (address, seen_through_block, seen_through_time) VALUES (@a, @b, @t)
+            ON CONFLICT (address) DO UPDATE SET seen_through_block = EXCLUDED.seen_through_block,
+                seen_through_time = EXCLUDED.seen_through_time
+            WHERE chain_progress.seen_through_block < EXCLUDED.seen_through_block
+            """, ct, ("a", progress.Address), ("b", progress.SeenThroughBlock), ("t", Time(progress.SeenThroughTime)));
+    }
+
+    public async Task<ChainProgress?> GetChainProgressAsync(string address, CancellationToken ct)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await using var cmd = Command(conn,
+            "SELECT seen_through_block, seen_through_time FROM chain_progress WHERE address = @a", ("a", address));
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct)
+            ? new ChainProgress(address, reader.GetInt64(0), reader.GetFieldValue<DateTimeOffset>(1))
+            : null;
+    }
+
+    public async Task<bool> IsKnownAddressAsync(string address, CancellationToken ct)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await using var cmd = Command(conn, """
+            SELECT EXISTS (SELECT 1 FROM orders WHERE wallet_address = @a)
+                OR EXISTS (SELECT 1 FROM chain_progress WHERE address = @a)
+            """, ("a", address));
+        return (bool)(await cmd.ExecuteScalarAsync(ct))!;
+    }
+
+    public async Task<int> ExpireDueOrdersAsync(DateTimeOffset now, int limit, CancellationToken ct)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await using var tx = await conn.BeginTransactionAsync(ct);
+
+        // Locked rows are skipped: another copy (or a payment being recorded) has them.
+        var due = new List<(string Reference, List<OrderLine> Lines)>();
+        await using (var cmd = Command(conn, """
+            SELECT o.reference, o.lines FROM orders o
+            JOIN chain_progress p ON p.address = o.wallet_address
+            WHERE o.status = 'PendingPayment' AND o.deadline < @now AND o.deadline < p.seen_through_time
+            ORDER BY o.deadline, o.reference
+            LIMIT @limit
+            FOR UPDATE OF o SKIP LOCKED
+            """, ("now", Time(now)), ("limit", limit)))
+        await using (var reader = await cmd.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                due.Add((reader.GetString(0), JsonSerializer.Deserialize<List<OrderLine>>(reader.GetString(1), Json)!));
+            }
+        }
+
+        if (due.Count == 0)
+        {
+            await tx.RollbackAsync(ct);
+            return 0;
+        }
+
+        // Stock back per item (deleted items get nothing), rows locked in id order like PlaceOrder.
+        var back = due.SelectMany(d => d.Lines).GroupBy(l => l.ItemId).OrderBy(g => g.Key)
+            .Select(g => (Id: g.Key, Quantity: g.Sum(l => l.Quantity))).ToList();
+        await ExecuteAsync(conn, "SELECT id FROM items WHERE id = ANY(@ids) ORDER BY id FOR UPDATE", ct,
+            ("ids", back.Select(b => b.Id).ToArray()));
+        await ExecuteAsync(conn, """
+            UPDATE items SET stock = items.stock + v.q, updated_at = @now
+            FROM unnest(@ids, @qs) AS v(id, q) WHERE items.id = v.id
+            """, ct, ("ids", back.Select(b => b.Id).ToArray()), ("qs", back.Select(b => b.Quantity).ToArray()),
+            ("now", Time(now)));
+        var expired = await ExecuteAsync(conn,
+            "UPDATE orders SET status = 'Expired' WHERE reference = ANY(@refs) AND status = 'PendingPayment'", ct,
+            ("refs", due.Select(d => d.Reference).ToArray()));
+        if (expired != due.Count)
+        {
+            throw new InvalidOperationException("Orders changed while locked for expiry.");
+        }
+
+        await tx.CommitAsync(ct);
+        return expired;
+    }
+
+    public async Task<long> CountWaitingAsync(string address, CancellationToken ct)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        await using var cmd = Command(conn,
+            "SELECT count(*) FROM orders WHERE wallet_address = @a AND status = 'PendingPayment'", ("a", address));
+        return (long)(await cmd.ExecuteScalarAsync(ct))!;
+    }
+
+    public async Task<Page<Payment>> ListPaymentsAsync(bool unmatchedOnly, int page, int pageSize, CancellationToken ct)
+    {
+        var where = unmatchedOnly ? "WHERE order_reference IS NULL" : "";
+        await using var conn = await _dataSource.OpenConnectionAsync(ct);
+        var payments = new List<Payment>();
+        await using (var cmd = Command(conn, $"""
+            SELECT {PaymentColumns} FROM payments {where}
+            ORDER BY block_time DESC, tx_hash DESC, log_index DESC LIMIT @limit OFFSET @offset
+            """, ("limit", pageSize), ("offset", (page - 1) * pageSize)))
+        await using (var reader = await cmd.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                payments.Add(new Payment(
+                    reader.GetString(0), reader.GetInt32(1), reader.GetInt64(2), reader.GetFieldValue<DateTimeOffset>(3),
+                    reader.GetString(4), reader.GetString(5), reader.GetFieldValue<BigInteger>(6),
+                    reader.IsDBNull(7) ? null : reader.GetString(7), reader.IsDBNull(8) ? null : reader.GetString(8),
+                    reader.GetFieldValue<DateTimeOffset>(9)));
+            }
+        }
+
+        await using var count = Command(conn, $"SELECT count(*) FROM payments {where}");
+        return new Page<Payment>(payments, page, pageSize, (long)(await count.ExecuteScalarAsync(ct))!);
+    }
+
+    private static async Task<string?> WaitingReferenceAsync(NpgsqlConnection conn, string account, CancellationToken ct)
+    {
+        await using var cmd = Command(conn,
+            "SELECT reference FROM orders WHERE paying_account = @a AND status = 'PendingPayment'", ("a", account));
+        return await cmd.ExecuteScalarAsync(ct) as string;
+    }
+
+    private static Order ReadOrder(DbDataReader r) => new(
+        r.GetString(0),
+        r.GetFieldValue<DateTimeOffset>(1),
+        r.GetString(2),
+        r.GetString(3),
+        r.GetInt64(4),
+        JsonSerializer.Deserialize<List<OrderLine>>(r.GetString(5), Json)!,
+        r.IsDBNull(6) ? null : r.GetString(6),
+        r.GetFieldValue<DateTimeOffset>(7),
+        r.IsDBNull(8) ? null : new OrderPayment(r.GetString(8), r.GetInt32(9), r.GetInt64(10), r.GetFieldValue<DateTimeOffset>(11)));
 
     public async Task<AdminRecord?> GetAdminAsync(CancellationToken ct)
     {

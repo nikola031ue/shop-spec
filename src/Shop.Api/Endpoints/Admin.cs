@@ -30,6 +30,7 @@ public static class AdminEndpoints
         admin.MapPut("/items/{id:guid}", UpdateItemAsync).RequireXsrf();
         admin.MapDelete("/items/{id:guid}", DeleteItemAsync).RequireXsrf();
         admin.MapGet("/orders", ListOrdersAsync);
+        admin.MapGet("/payments", ListPaymentsAsync);
         return app;
     }
 
@@ -50,19 +51,42 @@ public static class AdminEndpoints
 
     public sealed record OrderLineDto(Guid ItemId, string Name, long UnitPriceCents, int Quantity);
 
+    /// <summary>Spec 003's order plus the payment state (spec 005 contracts/shop-api.md "Admin").</summary>
     public sealed record OrderDto(
         string Reference,
         DateTimeOffset CreatedAt,
         string Status,
         long TotalCents,
         string WalletAddress,
-        IReadOnlyList<OrderLineDto> Lines)
+        IReadOnlyList<OrderLineDto> Lines,
+        string TotalBaseUnits,
+        string? PayingAccount,
+        DateTimeOffset Deadline,
+        [property: System.Text.Json.Serialization.JsonIgnore(
+            Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] PublicEndpoints.PaymentDto? Payment)
     {
-        public static OrderDto From(Order o) => new(o.Reference, o.CreatedAt, o.Status, o.TotalCents, o.WalletAddress,
-            o.Lines.Select(l => new OrderLineDto(l.ItemId, l.Name, l.UnitPriceCents, l.Quantity)).ToList());
+        public static OrderDto From(Order o, Settings settings) => new(o.Reference, o.CreatedAt, o.Status, o.TotalCents,
+            o.WalletAddress, o.Lines.Select(l => new OrderLineDto(l.ItemId, l.Name, l.UnitPriceCents, l.Quantity)).ToList(),
+            BaseUnits.Format(o.TotalBaseUnits), o.PayingAccount, o.Deadline,
+            o.Payment is { } p ? new PublicEndpoints.PaymentDto(p.Tx, p.Block, p.PaidAt, settings.ExplorerTxUrl + p.Tx) : null);
     }
 
     public sealed record OrderPageDto(IReadOnlyList<OrderDto> Orders, int Page, int PageSize, long Total);
+
+    /// <summary>A recorded transfer (contracts/shop-api.md "Admin" <c>/api/admin/payments</c>).</summary>
+    public sealed record PaymentDto(
+        string Tx,
+        int LogIndex,
+        long Block,
+        DateTimeOffset BlockTime,
+        string From,
+        string To,
+        string ValueBaseUnits,
+        string? OrderReference,
+        string? Reason,
+        string ExplorerUrl);
+
+    public sealed record PaymentPageDto(IReadOnlyList<PaymentDto> Payments, int Page, int PageSize, long Total);
 
     private static async Task<IResult> LoginAsync(
         LoginRequest request, AdminAuth auth, HttpContext context, CancellationToken ct)
@@ -171,7 +195,7 @@ public static class AdminEndpoints
         await store.DeleteItemAsync(id, ct) ? Results.NoContent() : ItemNotFound();
 
     /// <summary>US3: all orders newest first, 20 per page, with the lines as stored at ordering time.</summary>
-    private static async Task<IResult> ListOrdersAsync(IShopStore store, CancellationToken ct, int page = 1)
+    private static async Task<IResult> ListOrdersAsync(IShopStore store, Settings settings, CancellationToken ct, int page = 1)
     {
         if (page < 1)
         {
@@ -179,7 +203,24 @@ public static class AdminEndpoints
         }
 
         var result = await store.ListOrdersAsync(page, OrderPageSize, ct);
-        return Results.Ok(new OrderPageDto(result.Items.Select(OrderDto.From).ToList(), page, OrderPageSize, result.Total));
+        return Results.Ok(new OrderPageDto(
+            result.Items.Select(o => OrderDto.From(o, settings)).ToList(), page, OrderPageSize, result.Total));
+    }
+
+    /// <summary>Spec 005 FR-007, FR-016: recorded transfers, newest first; <c>matched=false</c> lists only unmatched ones.</summary>
+    private static async Task<IResult> ListPaymentsAsync(
+        IShopStore store, Settings settings, CancellationToken ct, int page = 1, bool? matched = null)
+    {
+        if (page < 1)
+        {
+            return Results.ValidationProblem(new Dictionary<string, string[]> { ["page"] = ["Page must be 1 or more."] });
+        }
+
+        var result = await store.ListPaymentsAsync(matched == false, page, OrderPageSize, ct);
+        return Results.Ok(new PaymentPageDto(
+            result.Items.Select(p => new PaymentDto(p.Tx, p.LogIndex, p.Block, p.BlockTime, p.FromAccount, p.ToAddress,
+                BaseUnits.Format(p.Value), p.OrderReference, p.UnmatchedReason, settings.ExplorerTxUrl + p.Tx)).ToList(),
+            page, OrderPageSize, result.Total));
     }
 
     private static IResult ItemNotFound() =>

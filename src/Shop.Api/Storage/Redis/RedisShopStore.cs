@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 using System.Reflection;
 using System.Text.Json;
 using Shop.Api.Domain;
@@ -11,10 +12,18 @@ namespace Shop.Api.Storage.Redis;
 /// <summary>
 /// Redis store (light shops): hashes and a sorted set, with every multi-key change in a Lua script
 /// (data-model.md "Redis layout", research R9, R12). Times are stored as Unix milliseconds.
+/// Spec 005 adds: the order JSON also carries <c>payingAccount</c> and <c>deadline</c> and is never
+/// rewritten; its mutable payment state lives in hash <c>shop:order-state:{ref}</c>; waiting orders
+/// are indexed by deadline (<c>shop:waiting</c>), account and address; transfers are
+/// <c>shop:payment:{tx}:{log}</c> with sorted sets <c>shop:payments</c>/<c>shop:payments-unmatched</c>;
+/// chain progress is hash <c>shop:chain-progress</c> (address → "block|ms").
 /// </summary>
 public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, IAsyncDisposable
 {
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 2;
+
+    /// <summary>Deadline given to orders placed before 0.3.0 (data-model.md "Schema scripts").</summary>
+    private static readonly TimeSpan LegacyPaymentWindow = TimeSpan.FromMinutes(30);
     private static readonly RedisKey Schema = "shop:schema";
     private static readonly RedisKey InitLock = "shop:lock:init";
     private static readonly RedisKey Items = "shop:items";
@@ -23,6 +32,11 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
     private static readonly RedisKey Admin = "shop:admin";
     private static readonly RedisKey ShopWideLock = "shop:admin:lock:" + LockoutKeys.ShopWide;
     private static readonly RedisKey DpKeys = "shop:dpkeys";
+    private static readonly RedisKey Waiting = "shop:waiting";
+    private static readonly RedisKey Addresses = "shop:addresses";
+    private static readonly RedisKey Progress = "shop:chain-progress";
+    private static readonly RedisKey Payments = "shop:payments";
+    private static readonly RedisKey UnmatchedPayments = "shop:payments-unmatched";
     private static readonly TimeSpan InitLockTtl = TimeSpan.FromSeconds(30);
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
@@ -33,6 +47,9 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
     private static readonly string FailedSignInLua = Script("failed_signin");
     private static readonly string ReleaseLockLua = Script("release_lock");
     private static readonly string BumpSessionLua = Script("bump_session");
+    private static readonly string RecordTransferLua = Script("record_transfer");
+    private static readonly string ExpireOrderLua = Script("expire_order");
+    private static readonly string AdvanceProgressLua = Script("advance_progress");
 
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private ConnectionMultiplexer? _connection;
@@ -59,9 +76,13 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
         try
         {
             var version = (int?)await db.StringGetAsync(Schema) ?? 0;
+            if (version < 2)
+            {
+                await MigrateToPaymentsAsync(db);
+            }
+
             if (version < SchemaVersion)
             {
-                // Version 1 needs no data changes; later versions migrate here.
                 await db.StringSetAsync(Schema, SchemaVersion);
             }
 
@@ -138,6 +159,8 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
             order.CreatedAt.ToUnixTimeMilliseconds(),
             order.WalletAddress,
             OrderStatus.PendingPayment,
+            order.PayingAccount,
+            order.Deadline.ToUnixTimeMilliseconds(),
         };
         foreach (var line in order.Lines)
         {
@@ -147,9 +170,18 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
         }
 
         var json = (string)(await (await DbAsync()).ScriptEvaluateAsync(PlaceOrderLua,
-            [Items, OrderKey(order.Reference), Orders], [.. args]))!;
+            [
+                Items, OrderKey(order.Reference), Orders, WaitingAccountKey(order.PayingAccount), Waiting,
+                WaitingAddressKey(order.WalletAddress), AccountLastKey(order.PayingAccount, order.WalletAddress), Addresses,
+            ],
+            [.. args]))!;
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
+        if (root.TryGetProperty("waiting", out var waiting))
+        {
+            return PlaceOrderResult.Waiting(waiting.GetString()!);
+        }
+
         if (root.TryGetProperty("taken", out _))
         {
             return PlaceOrderResult.Taken;
@@ -164,7 +196,7 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
                 p.TryGetProperty("currentStock", out var stock) ? stock.GetInt32() : null)).ToList());
         }
 
-        return PlaceOrderResult.Placed(ToOrder(Parse<StoredOrder>(json)));
+        return PlaceOrderResult.Placed(ToOrder(Parse<StoredOrder>(json), []));
     }
 
     public async Task<Page<Order>> ListOrdersAsync(int page, int pageSize, CancellationToken ct)
@@ -173,11 +205,116 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
         var total = await db.SortedSetLengthAsync(Orders);
         var start = (long)(page - 1) * pageSize;
         var references = await db.SortedSetRangeByRankAsync(Orders, start, start + pageSize - 1, SortOrder.Descending);
-        var values = references.Length == 0
-            ? []
-            : await db.StringGetAsync(references.Select(r => OrderKey((string)r!)).ToArray());
-        var orders = values.Where(v => !v.IsNull).Select(v => ToOrder(Parse<StoredOrder>(v))).ToList();
+        var orders = await LoadOrdersAsync(db, references.Select(r => (string)r!).ToList());
         return new Page<Order>(orders, page, pageSize, total);
+    }
+
+    public async Task<Order?> GetOrderAsync(string reference, CancellationToken ct) =>
+        (await LoadOrdersAsync(await DbAsync(), [reference])).SingleOrDefault();
+
+    public async Task<TransferOutcome> RecordTransferAsync(ChainTransfer transfer, DateTimeOffset receivedAt, CancellationToken ct)
+    {
+        var t = transfer;
+        var result = (string?)await (await DbAsync()).ScriptEvaluateAsync(RecordTransferLua, [],
+        [
+            t.Tx, t.LogIndex, t.Block, t.BlockTime.ToUnixTimeMilliseconds(), t.From, t.To, BaseUnits.Format(t.Value),
+            receivedAt.ToUnixTimeMilliseconds(),
+        ]);
+        return result switch
+        {
+            "paid" => TransferOutcome.Paid,
+            "unmatched" => TransferOutcome.Unmatched,
+            _ => TransferOutcome.AlreadyRecorded,
+        };
+    }
+
+    public async Task AdvanceChainProgressAsync(ChainProgress progress, CancellationToken ct) =>
+        await (await DbAsync()).ScriptEvaluateAsync(AdvanceProgressLua, [Progress, Addresses],
+            [progress.Address, progress.SeenThroughBlock, progress.SeenThroughTime.ToUnixTimeMilliseconds()]);
+
+    public async Task<ChainProgress?> GetChainProgressAsync(string address, CancellationToken ct)
+    {
+        var value = (string?)await (await DbAsync()).HashGetAsync(Progress, address);
+        if (value?.Split('|') is not [var block, var ms])
+        {
+            return null;
+        }
+
+        return new ChainProgress(address, long.Parse(block, CultureInfo.InvariantCulture),
+            DateTimeOffset.FromUnixTimeMilliseconds(long.Parse(ms, CultureInfo.InvariantCulture)));
+    }
+
+    public async Task<bool> IsKnownAddressAsync(string address, CancellationToken ct) =>
+        await (await DbAsync()).SetContainsAsync(Addresses, address);
+
+    public async Task<int> ExpireDueOrdersAsync(DateTimeOffset now, int limit, CancellationToken ct) =>
+        (int)await (await DbAsync()).ScriptEvaluateAsync(ExpireOrderLua, [Waiting, Items, Progress],
+            [now.ToUnixTimeMilliseconds(), limit]);
+
+    public async Task<long> CountWaitingAsync(string address, CancellationToken ct) =>
+        await (await DbAsync()).SetLengthAsync(WaitingAddressKey(address));
+
+    public async Task<Page<Payment>> ListPaymentsAsync(bool unmatchedOnly, int page, int pageSize, CancellationToken ct)
+    {
+        var db = await DbAsync();
+        var set = unmatchedOnly ? UnmatchedPayments : Payments;
+        var total = await db.SortedSetLengthAsync(set);
+        var start = (long)(page - 1) * pageSize;
+        var members = await db.SortedSetRangeByRankAsync(set, start, start + pageSize - 1, SortOrder.Descending);
+        var values = members.Length == 0
+            ? []
+            : await db.StringGetAsync(members.Select(m => (RedisKey)("shop:payment:" + m)).ToArray());
+        var payments = values.Where(v => !v.IsNull).Select(v => ToPayment(Parse<StoredPayment>(v))).ToList();
+        return new Page<Payment>(payments, page, pageSize, total);
+    }
+
+    /// <summary>
+    /// Version 2 (spec 005): index orders placed before 0.3.0 as waiting, with the legacy 30-minute
+    /// deadline. Their JSON stays as written; they have no paying account, so they can only expire.
+    /// </summary>
+    private static async Task MigrateToPaymentsAsync(IDatabase db)
+    {
+        foreach (var reference in await db.SortedSetRangeByRankAsync(Orders))
+        {
+            var value = await db.StringGetAsync(OrderKey((string)reference!));
+            if (value.IsNull)
+            {
+                continue;
+            }
+
+            var stored = Parse<StoredOrder>(value);
+            var state = (string?)await db.HashGetAsync(OrderStateKey(stored.Reference), "status");
+            if ((state ?? stored.Status) != OrderStatus.PendingPayment)
+            {
+                continue;
+            }
+
+            var deadline = stored.Deadline ?? stored.CreatedAt + (long)LegacyPaymentWindow.TotalMilliseconds;
+            await db.SortedSetAddAsync(Waiting, stored.Reference, deadline);
+            await db.SetAddAsync(WaitingAddressKey(stored.WalletAddress), stored.Reference);
+            await db.SetAddAsync(Addresses, stored.WalletAddress);
+        }
+    }
+
+    private static async Task<List<Order>> LoadOrdersAsync(IDatabase db, List<string> references)
+    {
+        if (references.Count == 0)
+        {
+            return [];
+        }
+
+        var values = await db.StringGetAsync(references.Select(OrderKey).ToArray());
+        var states = await Task.WhenAll(references.Select(r => db.HashGetAllAsync(OrderStateKey(r))));
+        var orders = new List<Order>(references.Count);
+        for (var i = 0; i < references.Count; i++)
+        {
+            if (!values[i].IsNull)
+            {
+                orders.Add(ToOrder(Parse<StoredOrder>(values[i]), states[i]));
+            }
+        }
+
+        return orders;
     }
 
     public async Task<AdminRecord?> GetAdminAsync(CancellationToken ct)
@@ -286,6 +423,14 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
 
     private static RedisKey OrderKey(string reference) => "shop:order:" + reference;
 
+    private static RedisKey OrderStateKey(string reference) => "shop:order-state:" + reference;
+
+    private static RedisKey WaitingAccountKey(string account) => "shop:waiting-account:" + account;
+
+    private static RedisKey WaitingAddressKey(string address) => "shop:waiting-address:" + address;
+
+    private static RedisKey AccountLastKey(string account, string address) => $"shop:account-last:{account}:{address}";
+
     private static string Id(Guid id) => id.ToString("D");
 
     private static T Parse<T>(RedisValue value) => JsonSerializer.Deserialize<T>((string)value!, Json)!;
@@ -301,12 +446,39 @@ public sealed class RedisShopStore(ConfigurationOptions options) : IShopStore, I
     private static Item ToItem(StoredItem s) => new(Guid.Parse(s.Id), s.Name, s.Stock, s.PriceCents,
         DateTimeOffset.FromUnixTimeMilliseconds(s.CreatedAt), DateTimeOffset.FromUnixTimeMilliseconds(s.UpdatedAt));
 
-    private static Order ToOrder(StoredOrder s) => new(s.Reference, DateTimeOffset.FromUnixTimeMilliseconds(s.CreatedAt),
-        s.Status, s.WalletAddress, s.TotalCents, s.Lines);
+    private static Order ToOrder(StoredOrder s, HashEntry[] state)
+    {
+        var fields = state.ToDictionary(e => (string)e.Name!, e => (string?)e.Value);
+        var status = fields.GetValueOrDefault("status") ?? s.Status;
+        OrderPayment? payment = null;
+        if (status == OrderStatus.Paid)
+        {
+            payment = new OrderPayment(
+                fields["paidTx"]!,
+                int.Parse(fields["paidLogIndex"]!, CultureInfo.InvariantCulture),
+                long.Parse(fields["paidBlock"]!, CultureInfo.InvariantCulture),
+                DateTimeOffset.FromUnixTimeMilliseconds(long.Parse(fields["paidAt"]!, CultureInfo.InvariantCulture)));
+        }
+
+        var createdAt = DateTimeOffset.FromUnixTimeMilliseconds(s.CreatedAt);
+        var deadline = s.Deadline is { } d ? DateTimeOffset.FromUnixTimeMilliseconds(d) : createdAt + LegacyPaymentWindow;
+        return new Order(s.Reference, createdAt, status, s.WalletAddress, s.TotalCents, s.Lines, s.PayingAccount, deadline,
+            payment);
+    }
+
+    private static Payment ToPayment(StoredPayment p) => new(
+        p.Tx, p.LogIndex, p.Block, DateTimeOffset.FromUnixTimeMilliseconds(p.BlockTime), p.FromAccount, p.ToAddress,
+        BigInteger.Parse(p.Value, CultureInfo.InvariantCulture), p.OrderReference, p.UnmatchedReason,
+        DateTimeOffset.FromUnixTimeMilliseconds(p.ReceivedAt));
 
     private sealed record StoredItem(
         string Id, string Name, string NameKey, int Stock, long PriceCents, long CreatedAt, long UpdatedAt);
 
     private sealed record StoredOrder(
-        string Reference, long CreatedAt, string Status, string WalletAddress, long TotalCents, List<OrderLine> Lines);
+        string Reference, long CreatedAt, string Status, string WalletAddress, long TotalCents, List<OrderLine> Lines,
+        string? PayingAccount = null, long? Deadline = null);
+
+    private sealed record StoredPayment(
+        string Tx, int LogIndex, long Block, long BlockTime, string FromAccount, string ToAddress, string Value,
+        string? OrderReference, string? UnmatchedReason, long ReceivedAt);
 }

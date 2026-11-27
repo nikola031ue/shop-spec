@@ -1,17 +1,26 @@
--- Atomic order placement (research R9): check every line, then decrement stock and store the
--- order, or change nothing and return the problems.
+-- Atomic order placement (research R9; spec 005 FR-005a): refuse if the paying account already has
+-- an order waiting for payment, else check every line, then decrement stock and store the order,
+-- or change nothing and return the problems.
 -- KEYS[1] shop:items  KEYS[2] shop:order:{reference}  KEYS[3] shop:orders
+-- KEYS[4] shop:waiting-account:{payingAccount}  KEYS[5] shop:waiting  KEYS[6] shop:waiting-address:{wallet}
+-- KEYS[7] shop:account-last:{payingAccount}:{wallet}  KEYS[8] shop:addresses
 -- ARGV[1] reference  ARGV[2] createdAt (ms)  ARGV[3] walletAddress  ARGV[4] status
--- ARGV[5..] itemId, quantity, expectedUnitPriceCents
+-- ARGV[5] payingAccount  ARGV[6] deadline (ms)
+-- ARGV[7..] itemId, quantity, expectedUnitPriceCents
 -- The expected price is only compared (FR-013). Stored line prices and the total are always
 -- taken from the stored item, never from the request.
+local waiting = redis.call('GET', KEYS[4])
+if waiting then
+  return cjson.encode({waiting = waiting})
+end
+
 if redis.call('EXISTS', KEYS[2]) == 1 then
   return cjson.encode({taken = true})
 end
 
 local found, problems, lines = {}, {}, {}
 local total = 0
-for i = 5, #ARGV, 3 do
+for i = 7, #ARGV, 3 do
   local id, qty, expected = ARGV[i], tonumber(ARGV[i + 1]), tonumber(ARGV[i + 2])
   local raw = redis.call('HGET', KEYS[1], id)
   if not raw then
@@ -43,10 +52,16 @@ for _, e in ipairs(found) do
   redis.call('HSET', KEYS[1], e.id, cjson.encode(e.item))
 end
 
--- The total is written with %.0f because cjson keeps only 14 significant digits.
+-- Numbers are written with %.0f because cjson keeps only 14 significant digits.
 local order = '{"reference":' .. cjson.encode(ARGV[1]) .. ',"createdAt":' .. ARGV[2] ..
   ',"status":' .. cjson.encode(ARGV[4]) .. ',"walletAddress":' .. cjson.encode(ARGV[3]) ..
-  ',"totalCents":' .. string.format('%.0f', total) .. ',"lines":' .. cjson.encode(lines) .. '}'
+  ',"totalCents":' .. string.format('%.0f', total) .. ',"lines":' .. cjson.encode(lines) ..
+  ',"payingAccount":' .. cjson.encode(ARGV[5]) .. ',"deadline":' .. ARGV[6] .. '}'
 redis.call('SET', KEYS[2], order)
 redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
+redis.call('SET', KEYS[4], ARGV[1])
+redis.call('ZADD', KEYS[5], ARGV[6], ARGV[1])
+redis.call('SADD', KEYS[6], ARGV[1])
+redis.call('SET', KEYS[7], ARGV[1])
+redis.call('SADD', KEYS[8], ARGV[3])
 return order
