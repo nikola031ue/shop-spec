@@ -262,6 +262,14 @@ public sealed class AdminAuthTests
         public Task<bool> DeleteItemAsync(Guid id, CancellationToken ct) => throw new NotSupportedException();
         public Task<PlaceOrderResult> PlaceOrderAsync(NewOrder order, CancellationToken ct) => throw new NotSupportedException();
         public Task<Page<Order>> ListOrdersAsync(int page, int pageSize, CancellationToken ct) => throw new NotSupportedException();
+        public Task<Order?> GetOrderAsync(string reference, CancellationToken ct) => throw new NotSupportedException();
+        public Task<TransferOutcome> RecordTransferAsync(ChainTransfer transfer, DateTimeOffset receivedAt, CancellationToken ct) => throw new NotSupportedException();
+        public Task AdvanceChainProgressAsync(ChainProgress progress, CancellationToken ct) => throw new NotSupportedException();
+        public Task<ChainProgress?> GetChainProgressAsync(string address, CancellationToken ct) => throw new NotSupportedException();
+        public Task<bool> IsKnownAddressAsync(string address, CancellationToken ct) => throw new NotSupportedException();
+        public Task<int> ExpireDueOrdersAsync(DateTimeOffset now, int limit, CancellationToken ct) => throw new NotSupportedException();
+        public Task<long> CountWaitingAsync(string address, CancellationToken ct) => throw new NotSupportedException();
+        public Task<Page<Payment>> ListPaymentsAsync(bool unmatchedOnly, int page, int pageSize, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<DataProtectionKey>> GetDataProtectionKeysAsync(CancellationToken ct) => throw new NotSupportedException();
         public Task StoreDataProtectionKeyAsync(string name, string xml, CancellationToken ct) => throw new NotSupportedException();
     }

@@ -2,23 +2,35 @@ using System.Security.Cryptography;
 
 namespace Shop.Api.Domain;
 
+/// <summary>data-model.md <c>Order.status</c>: PendingPayment → Paid | Expired, nothing else (spec 005).</summary>
 public static class OrderStatus
 {
-    /// <summary>The only status in this feature; spec 005 adds the rest.</summary>
     public const string PendingPayment = "PendingPayment";
+    public const string Paid = "Paid";
+    public const string Expired = "Expired";
 }
 
 /// <summary>A stored order line: a snapshot taken at ordering time (data-model.md "OrderLine").</summary>
 public sealed record OrderLine(Guid ItemId, string Name, long UnitPriceCents, int Quantity);
 
-/// <summary>data-model.md "Order".</summary>
+/// <summary>
+/// data-model.md "Order" (spec 003, extended by spec 005). <see cref="PayingAccount"/> is null for
+/// orders placed before 0.3.0: they can never match a payment and simply expire.
+/// </summary>
 public sealed record Order(
     string Reference,
     DateTimeOffset CreatedAt,
     string Status,
     string WalletAddress,
     long TotalCents,
-    IReadOnlyList<OrderLine> Lines);
+    IReadOnlyList<OrderLine> Lines,
+    string? PayingAccount,
+    DateTimeOffset Deadline,
+    OrderPayment? Payment = null)
+{
+    /// <summary>data-model.md <c>Order.total_base_units</c>: the exact mUSDT amount to pay.</summary>
+    public System.Numerics.BigInteger TotalBaseUnits => BaseUnits.FromCents(TotalCents);
+}
 
 /// <summary>
 /// One requested line as sent by the customer. <see cref="ExpectedUnitPriceCents"/> is the price
@@ -27,12 +39,17 @@ public sealed record Order(
 /// </summary>
 public sealed record OrderRequestLine(Guid ItemId, int Quantity, long ExpectedUnitPriceCents);
 
-/// <summary>An order ready for the store: reference, time and wallet fixed, lines normalised.</summary>
+/// <summary>
+/// An order ready for the store: reference, time, wallet, paying account (EIP-55) and deadline fixed,
+/// lines normalised.
+/// </summary>
 public sealed record NewOrder(
     string Reference,
     DateTimeOffset CreatedAt,
     string WalletAddress,
-    IReadOnlyList<OrderRequestLine> Lines);
+    IReadOnlyList<OrderRequestLine> Lines,
+    string PayingAccount,
+    DateTimeOffset Deadline);
 
 /// <summary>Rules for data-model.md <c>Order.lines</c> and <c>OrderLine.quantity</c>.</summary>
 public static class OrderRules

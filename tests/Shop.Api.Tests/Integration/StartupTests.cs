@@ -47,6 +47,7 @@ public sealed class ShopApp : WebApplicationFactory<Program>
         ["SHOP_NAME"] = "Acme",
         ["WALLET_ADDRESS"] = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
         ["ADMIN_PASSWORD"] = AdminPassword,
+        ["TOKEN_ADDRESS"] = TestAccounts.Token,
     };
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)

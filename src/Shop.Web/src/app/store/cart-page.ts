@@ -1,9 +1,11 @@
+import { HttpErrorResponse } from '@angular/common/http';
 import { Component, inject, signal } from '@angular/core';
 import { Router, RouterLink } from '@angular/router';
 import { formatCents, problemMessage } from '../shared/api';
 import { Cart } from './cart';
 import { correctCart, orderProblems } from './problems';
 import { ShopApi } from './shop-api';
+import { Wallet, walletMessage } from './wallet';
 
 /** Cart with quantities, removal and checkout; server-side changes are shown for confirmation. */
 @Component({
@@ -24,7 +26,12 @@ import { ShopApi } from './shop-api';
         </div>
       }
       @if (notice()) { <p class="notice" role="status">{{ notice() }}</p> }
-      @if (error()) { <p class="error" role="alert">{{ error() }}</p> }
+      @if (error()) {
+        <p class="error" role="alert">
+          {{ error() }}
+          @if (waitingOrder()) { <a [routerLink]="['/orders', waitingOrder()]">Open order {{ waitingOrder() }}</a> }
+        </p>
+      }
 
       @if (cart.lines().length === 0) {
         <p>Your cart is empty. <a routerLink="/">Browse items</a></p>
@@ -52,15 +59,22 @@ import { ShopApi } from './shop-api';
             <tr><th scope="row" colspan="3">Total</th><td colspan="2"><strong>{{ price(cart.totalCents()) }} mUSDT</strong></td></tr>
           </tfoot>
         </table>
-        <button type="button" class="checkout" [disabled]="busy()" (click)="checkout()">
-          {{ changes().length > 0 ? 'Confirm and place order' : 'Place order' }}
-        </button>
+        @if (wallet.account(); as account) {
+          <p class="muted">Paying account: <span class="mono">{{ account }}</span></p>
+          <button type="button" class="checkout" [disabled]="busy()" (click)="checkout()">
+            {{ changes().length > 0 ? 'Confirm and place order' : 'Place order' }}
+          </button>
+        } @else {
+          <p class="muted">You pay in mUSDT on Sepolia with MetaMask. Connect the account that will pay.</p>
+          <button type="button" class="checkout" [disabled]="busy()" (click)="connect()">Connect MetaMask</button>
+        }
       }
     </section>
   `,
 })
 export class CartPage {
   protected readonly cart = inject(Cart);
+  protected readonly wallet = inject(Wallet);
   private readonly api = inject(ShopApi);
   private readonly router = inject(Router);
 
@@ -68,6 +82,7 @@ export class CartPage {
   protected readonly error = signal('');
   protected readonly notice = signal('');
   protected readonly changes = signal<string[]>([]);
+  protected readonly waitingOrder = signal('');
   protected readonly price = formatCents;
 
   protected setQuantity(itemId: string, event: Event): void {
@@ -77,17 +92,36 @@ export class CartPage {
     this.notice.set(change.message ?? '');
   }
 
+  /** Spec 005 FR-002a: the order is placed for the connected MetaMask account. */
+  protected async connect(): Promise<void> {
+    this.busy.set(true);
+    this.error.set('');
+    try {
+      await this.wallet.connect();
+    } catch (e) {
+      this.error.set(walletMessage(e));
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
   protected async checkout(): Promise<void> {
+    const account = this.wallet.account();
+    if (!account) {
+      return this.connect();
+    }
     this.busy.set(true);
     this.error.set('');
     this.notice.set('');
+    this.waitingOrder.set('');
     const lines = this.cart.lines();
     try {
       const order = await this.api.placeOrder(
         lines.map((l) => ({ itemId: l.itemId, quantity: l.quantity, unitPriceCents: l.unitPriceCents })),
+        account,
       );
       this.cart.clear();
-      await this.router.navigate(['/orders', order.reference], { state: { totalCents: order.totalCents } });
+      await this.router.navigate(['/orders', order.reference]);
     } catch (e) {
       const problems = orderProblems(e);
       if (problems) {
@@ -95,6 +129,10 @@ export class CartPage {
         this.cart.replace(correction.lines);
         this.changes.set(correction.messages);
       } else {
+        // FR-005a: one waiting order per account; link to it.
+        if (e instanceof HttpErrorResponse && e.error?.reason === 'waitingOrder' && typeof e.error.reference === 'string') {
+          this.waitingOrder.set(e.error.reference);
+        }
         this.error.set(problemMessage(e));
       }
     } finally {

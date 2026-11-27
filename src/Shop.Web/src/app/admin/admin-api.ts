@@ -33,6 +33,32 @@ export interface Order {
   totalCents: number;
   walletAddress: string;
   lines: OrderLine[];
+  /** Spec 005: the payment state. */
+  totalBaseUnits: string;
+  payingAccount: string | null;
+  deadline: string;
+  payment?: { tx: string; block: number; paidAt: string; explorerUrl: string };
+}
+
+/** A recorded transfer to one of the shop's addresses (spec 005 FR-007, FR-016). */
+export interface Payment {
+  tx: string;
+  logIndex: number;
+  block: number;
+  blockTime: string;
+  from: string;
+  to: string;
+  valueBaseUnits: string;
+  orderReference: string | null;
+  reason: string | null;
+  explorerUrl: string;
+}
+
+export interface PaymentPage {
+  payments: Payment[];
+  page: number;
+  pageSize: number;
+  total: number;
 }
 
 export interface OrderPage {
@@ -96,5 +122,10 @@ export class AdminApi {
 
   orders(page: number): Promise<OrderPage> {
     return firstValueFrom(this.http.get<OrderPage>('/api/admin/orders', { params: { page } }));
+  }
+
+  /** Transfers that paid no order (spec 005 FR-007). */
+  unmatchedPayments(page = 1): Promise<PaymentPage> {
+    return firstValueFrom(this.http.get<PaymentPage>('/api/admin/payments', { params: { matched: false, page } }));
   }
 }

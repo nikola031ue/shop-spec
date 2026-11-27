@@ -8,7 +8,7 @@ namespace Shop.Api.Tests.Integration;
 /// with its own Testcontainers database, so both stores pass the identical suite (SC-003). Tests in
 /// one class run sequentially; each starts from an empty, initialised store.
 /// </summary>
-public abstract class ShopStoreContract : IAsyncLifetime
+public abstract partial class ShopStoreContract : IAsyncLifetime
 {
     protected static readonly DateTimeOffset T0 = new(2026, 11, 24, 10, 0, 0, 123, TimeSpan.Zero);
     private const string Wallet = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
@@ -66,7 +66,7 @@ public abstract class ShopStoreContract : IAsyncLifetime
     }
 
     private static NewOrder Order(params OrderRequestLine[] lines) =>
-        new(OrderReference.New(), T0.AddMinutes(1), Wallet, lines);
+        new(OrderReference.New(), T0.AddMinutes(1), Wallet, lines, TestAccounts.New(), T0.AddMinutes(31));
 
     // ---- Initialisation and admin ----
 
@@ -461,7 +461,7 @@ public abstract class ShopStoreContract : IAsyncLifetime
 
         Assert.Empty(result.Problems);
         var expected = new Order(request.Reference, T0.AddMinutes(1), OrderStatus.PendingPayment, Wallet, 3999,
-            [new(shirt.Id, "Shirt", 1500, 2), new(hat.Id, "Hat", 999, 1)]);
+            [new(shirt.Id, "Shirt", 1500, 2), new(hat.Id, "Hat", 999, 1)], request.PayingAccount, request.Deadline);
         AssertOrder(expected, result.Order!);
         Assert.Equal(3, (await Store.GetItemAsync(shirt.Id, Ct))!.Stock);
         Assert.Equal(0, (await Store.GetItemAsync(hat.Id, Ct))!.Stock);
@@ -543,7 +543,9 @@ public abstract class ShopStoreContract : IAsyncLifetime
         var first = Order(new OrderRequestLine(shirt.Id, 1, 1500));
         await Store.PlaceOrderAsync(first, Ct);
 
-        var again = await Store.PlaceOrderAsync(first with { Lines = [new(shirt.Id, 2, 1500)] }, Ct);
+        // Another paying account: the same account would be refused earlier, for its waiting order (FR-005a).
+        var again = await Store.PlaceOrderAsync(
+            first with { Lines = [new(shirt.Id, 2, 1500)], PayingAccount = TestAccounts.New() }, Ct);
 
         Assert.True(again.ReferenceTaken);
         Assert.Null(again.Order);

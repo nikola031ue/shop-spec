@@ -1,9 +1,13 @@
 import { DatePipe } from '@angular/common';
 import { Component, OnInit, computed, inject, signal } from '@angular/core';
 import { formatCents, problemMessage } from '../../shared/api';
-import { AdminApi, Order, OrderPage } from '../admin-api';
+import { formatBaseUnits } from '../../shared/eip1193';
+import { AdminApi, Order, OrderPage, PaymentPage } from '../admin-api';
 
-/** US3: orders newest first, 20 per page, with expandable lines (snapshot at ordering time). */
+/**
+ * US3: orders newest first, 20 per page, with expandable lines (snapshot at ordering time); spec 005:
+ * payment status with a link to the transaction, and the transfers that paid no order.
+ */
 @Component({
   selector: 'app-admin-orders',
   imports: [DatePipe],
@@ -24,7 +28,13 @@ import { AdminApi, Order, OrderPage } from '../admin-api';
             <tr>
               <td class="mono">{{ order.reference }}</td>
               <td>{{ order.createdAt | date: 'yyyy-MM-dd HH:mm' }}</td>
-              <td>{{ statusLabel(order.status) }}</td>
+              <td class="status">
+                {{ statusLabel(order.status) }}
+                @if (order.payment) {
+                  <a [href]="order.payment.explorerUrl" target="_blank" rel="noopener noreferrer"
+                     [title]="'Paid ' + (order.payment.paidAt | date: 'yyyy-MM-dd HH:mm:ss')">transaction</a>
+                }
+              </td>
               <td>{{ price(order.totalCents) }}</td>
               <td>
                 <button type="button" class="secondary" [attr.aria-expanded]="isOpen(order)"
@@ -51,7 +61,8 @@ import { AdminApi, Order, OrderPage } from '../admin-api';
                       }
                     </tbody>
                   </table>
-                  <p class="muted">Pay to {{ order.walletAddress }}</p>
+                  <p class="muted">Pay to {{ order.walletAddress }}@if (order.payingAccount) { from {{ order.payingAccount }}}
+                    @if (order.payment) { — paid {{ order.payment.paidAt | date: 'yyyy-MM-dd HH:mm:ss' }} } @else if (order.status === 'PendingPayment') { — due by {{ order.deadline | date: 'yyyy-MM-dd HH:mm' }} }</p>
                 </td>
               </tr>
             }
@@ -60,6 +71,27 @@ import { AdminApi, Order, OrderPage } from '../admin-api';
           }
         </tbody>
       </table>
+
+      @if ((unmatched()?.payments ?? []).length > 0) {
+        <h3>Payments not matched</h3>
+        <p class="muted">Transfers to the shop's address that paid no order. The platform can't refund them; settle them with the buyer.</p>
+        <table class="unmatched">
+          <thead>
+            <tr><th scope="col">Time</th><th scope="col">From</th><th scope="col">Amount (mUSDT)</th><th scope="col">Why</th><th scope="col">Transaction</th></tr>
+          </thead>
+          <tbody>
+            @for (p of unmatched()!.payments; track p.tx + p.logIndex) {
+              <tr>
+                <td>{{ p.blockTime | date: 'yyyy-MM-dd HH:mm' }}</td>
+                <td class="mono">{{ p.from }}</td>
+                <td>{{ units(p.valueBaseUnits) }}</td>
+                <td>{{ reasonLabel(p.reason) }}</td>
+                <td><a [href]="p.explorerUrl" target="_blank" rel="noopener noreferrer">view</a></td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      }
 
       @if (pages() > 1) {
         <div class="pager">
@@ -75,6 +107,7 @@ export class AdminOrders implements OnInit {
   private readonly api = inject(AdminApi);
 
   protected readonly page = signal<OrderPage | null>(null);
+  protected readonly unmatched = signal<PaymentPage | null>(null);
   protected readonly pageNumber = signal(1);
   protected readonly loading = signal(false);
   protected readonly error = signal('');
@@ -105,6 +138,26 @@ export class AdminOrders implements OnInit {
     return status === 'PendingPayment' ? 'Waiting for payment' : status;
   }
 
+  protected reasonLabel(reason: string | null): string {
+    switch (reason) {
+      case 'amount':
+        return 'Wrong amount';
+      case 'account':
+        return 'Unknown account';
+      case 'late':
+        return 'After the order expired';
+      case 'duplicate':
+        return 'Order already paid';
+      default:
+        return 'No matching order';
+    }
+  }
+
+  /** Base units → "11.00"; amounts below a cent show as "0.00". */
+  protected units(value: string): string {
+    return formatBaseUnits(BigInt(value));
+  }
+
   protected go(page: number): void {
     this.pageNumber.set(page);
     void this.load();
@@ -114,7 +167,9 @@ export class AdminOrders implements OnInit {
     this.loading.set(true);
     this.error.set('');
     try {
-      this.page.set(await this.api.orders(this.pageNumber()));
+      const [orders, unmatched] = await Promise.all([this.api.orders(this.pageNumber()), this.api.unmatchedPayments()]);
+      this.page.set(orders);
+      this.unmatched.set(unmatched);
       this.open.set(new Set());
     } catch (e) {
       this.error.set(problemMessage(e));

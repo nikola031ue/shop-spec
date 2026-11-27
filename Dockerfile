@@ -32,5 +32,6 @@ COPY --from=api /app ./
 # and by Docker's default container sysctls).
 ENV ASPNETCORE_HTTP_PORTS=80
 USER $APP_UID
-EXPOSE 80
+# 80: the shop (Ingress). 8081: the operator's internal API, only with INTERNAL_TOKEN (spec 005).
+EXPOSE 80 8081
 ENTRYPOINT ["dotnet", "Shop.Api.dll"]
